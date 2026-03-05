@@ -1,36 +1,66 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# CoResearch
 
-## Getting Started
+Production-ready Next.js + Firebase collaborative research platform.
 
-First, run the development server:
+## Setup
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+1. Install dependencies:
+`npm install`
+
+2. Create `.env.local` with:
+
+```env
+NEXT_PUBLIC_FIREBASE_API_KEY=
+NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN=
+NEXT_PUBLIC_FIREBASE_PROJECT_ID=
+NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET=
+NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID=
+NEXT_PUBLIC_FIREBASE_APP_ID=
+NEXT_PUBLIC_FIREBASE_MEASUREMENT_ID=
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+3. Enable Firebase services:
+- Authentication -> Email/Password
+- Firestore Database
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+4. Required Firestore collections:
+- `universities` (at least one document with a `name` field)
+- `users`
+- `pendingUsers`
+- `documents`
+- `chatMessages`
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+## Seed Admin + University
 
-## Learn More
+1. Fill `seed.json` with your real admin UID/email/university values.
 
-To learn more about Next.js, take a look at the following resources:
+2. Download a Firebase service account key JSON from:
+Firebase Console -> Project Settings -> Service accounts -> Generate new private key
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+3. Run seeding (PowerShell):
+`$env:FIREBASE_SERVICE_ACCOUNT_JSON = Get-Content .\service-account.json -Raw`
+`npm run seed:firestore`
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+## Run
 
-## Deploy on Vercel
+- Dev: `npm run dev`
+- Type-check: `npm run type-check`
+- Lint: `npm run lint`
+- Build: `npm run build`
+- Seed Firestore: `npm run seed:firestore`
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+## Firestore Security Rules (Production)
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+Deploy included rules/indexes from project root:
+
+1. Install Firebase CLI:
+`npm i -g firebase-tools`
+
+2. Login:
+`firebase login`
+
+3. Select project:
+`firebase use coresearch-d5239`
+
+4. Deploy rules and indexes:
+`firebase deploy --only firestore:rules,firestore:indexes,storage`

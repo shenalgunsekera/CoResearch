@@ -1,0 +1,104 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function currentUser() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid));
+    }
+
+    function isAdmin() {
+      return signedIn() &&
+        currentUser().data.role == "admin" &&
+        currentUser().data.verified == true;
+    }
+
+    function isOwnerOrCollaborator(docData) {
+      return signedIn() &&
+        (docData.ownerId == request.auth.uid ||
+          request.auth.uid in docData.collaboratorIds);
+    }
+
+    match /universities/{universityId} {
+      allow read: if true;
+      allow write: if false;
+    }
+
+    match /users/{userId} {
+      allow create: if signedIn() &&
+        request.auth.uid == userId &&
+        request.resource.data.role == "student" &&
+        request.resource.data.verified == false;
+
+      allow read: if signedIn();
+
+      allow update: if signedIn() && (
+        request.auth.uid == userId ||
+        (isAdmin() &&
+          resource.data.role == "student" &&
+          request.resource.data.diff(resource.data).changedKeys().hasOnly(["verified"]))
+      );
+
+      allow delete: if false;
+    }
+
+    match /documentComments/{commentId} {
+      allow read: if signedIn();
+
+      allow create: if signedIn() &&
+        request.resource.data.authorId == request.auth.uid;
+
+      allow update: if signedIn() &&
+        resource.data.authorId == request.auth.uid;
+
+      allow delete: if signedIn() &&
+        resource.data.authorId == request.auth.uid;
+    }
+
+    match /pendingUsers/{pendingUserId} {
+      allow create: if signedIn() &&
+        request.resource.data.userId == request.auth.uid &&
+        request.resource.data.status == "pending";
+
+      allow read: if isAdmin() &&
+        resource.data.university == currentUser().data.university.name;
+
+      allow update: if isAdmin() &&
+        resource.data.university == currentUser().data.university.name &&
+        request.resource.data.diff(resource.data).changedKeys().hasOnly(["status"]);
+
+      allow delete: if false;
+    }
+
+    match /documents/{documentId} {
+      allow read: if resource.data.stage in ["review", "published"] ||
+        isOwnerOrCollaborator(resource.data);
+
+      allow create: if signedIn() &&
+        request.resource.data.ownerId == request.auth.uid &&
+        request.auth.uid in request.resource.data.collaboratorIds;
+
+      allow update: if signedIn() && (
+        request.auth.uid == resource.data.ownerId ||
+        (resource.data.collaboratorIds is list &&
+          request.auth.uid in resource.data.collaboratorIds)
+      );
+
+      allow delete: if signedIn() &&
+        request.auth.uid == resource.data.ownerId;
+    }
+
+    match /chatMessages/{messageId} {
+      allow read: if signedIn() &&
+        resource.data.university == currentUser().data.university.name;
+
+      allow create: if signedIn() &&
+        request.resource.data.senderId == request.auth.uid &&
+        request.resource.data.university == currentUser().data.university.name;
+
+      allow update, delete: if false;
+    }
+  }
+}

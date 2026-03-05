@@ -1,0 +1,27 @@
+{
+  "universities": [
+    {
+      "id": "1",
+      "name": "uni",
+      "domain": "uni"
+    }
+  ],
+  "users": [
+    {
+      "id": "g7DHXmS3PaNdGjBYz6Llc5AQaki2",
+      "email": "shenalgd@gmail.com",
+      "name": "shenal",
+      "role": "admin",
+      "verified": true,
+      "studentId": "2525139",
+      "program": "SE",
+      "year": 3,
+      "interests": [],
+      "university": {
+        "id": "1",
+        "name": "uni",
+        "domain": "uni"
+      }
+    }
+  ]
+}
