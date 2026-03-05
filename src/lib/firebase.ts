@@ -22,7 +22,7 @@ const missingKeys = Object.entries(firebaseConfig)
 export const isFirebaseConfigured = missingKeys.length === 0;
 export const firebaseEnvError =
   missingKeys.length > 0
-    ? `Missing Firebase env vars: ${missingKeys.join(", ")}. Set them in .env.local.`
+    ? `Missing Firebase env vars: ${missingKeys.join(", ")}. Local: set in .env.local. Vercel: set in Project Settings -> Environment Variables for the correct project/environment, then redeploy.`
     : null;
 
 const app = isFirebaseConfigured
