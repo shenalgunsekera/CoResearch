@@ -22,6 +22,7 @@ interface AuthContextType {
   login: (email: string, password: string) => Promise<void>;
   register: (data: RegisterData) => Promise<void>;
   logout: () => Promise<void>;
+  refreshUser: () => Promise<User | null>;
   isAuthenticated: boolean;
   isAdmin: boolean;
   isLoading: boolean;
@@ -71,11 +72,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
       if (!profile) {
         throw new Error("Account profile not found.");
-      }
-
-      if (!profile.verified && profile.role === "student") {
-        await signOut(auth);
-        throw new Error("Your account is pending admin approval.");
       }
 
       setUser(profile);
@@ -147,11 +143,25 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setUser(null);
   };
 
+  const refreshUser = async (): Promise<User | null> => {
+    if (!auth) {
+      throw new Error(firebaseEnvError ?? "Firebase is not configured.");
+    }
+    if (!auth.currentUser) {
+      setUser(null);
+      return null;
+    }
+    const profile = await getUserProfile(auth.currentUser.uid);
+    setUser(profile);
+    return profile;
+  };
+
   const value: AuthContextType = {
     user,
     login,
     register,
     logout,
+    refreshUser,
     isAuthenticated: !!user,
     isAdmin: user?.role === "admin",
     isLoading,

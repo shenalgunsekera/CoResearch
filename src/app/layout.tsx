@@ -3,6 +3,7 @@ import "./globals.css";
 import { AuthProvider } from "@/lib/auth-context";
 import { Toaster } from "@/components/ui/sonner";
 import { AppStartupSplash } from "@/components/app-startup-splash";
+import { VerificationGate } from "@/components/verification-gate";
 
 export const metadata: Metadata = {
   title: "CoResearch - Collaborative Research Platform",
@@ -20,6 +21,7 @@ export default function RootLayout({
       <body className="min-h-screen antialiased">
         <AppStartupSplash />
         <AuthProvider>
+          <VerificationGate />
           <main className="min-h-screen">{children}</main>
           <Toaster />
         </AuthProvider>
