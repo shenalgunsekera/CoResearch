@@ -41,6 +41,8 @@ export default function RegisterPage() {
   const [loading, setLoading] = useState(false);
   const [success, setSuccess] = useState(false);
   const [universities, setUniversities] = useState<University[]>([]);
+  const [universitiesLoading, setUniversitiesLoading] = useState(true);
+  const [universitiesError, setUniversitiesError] = useState<string | null>(null);
   const { register, isLoading, user } = useAuth();
   const router = useRouter();
 
@@ -51,9 +53,25 @@ export default function RegisterPage() {
   }, [isLoading, user, router]);
 
   useEffect(() => {
-    getUniversities()
-      .then(setUniversities)
-      .catch(() => toast.error("Failed to load universities"));
+    const loadUniversities = async () => {
+      setUniversitiesLoading(true);
+      setUniversitiesError(null);
+      try {
+        const data = await getUniversities();
+        setUniversities(data);
+        if (data.length === 0) {
+          setUniversitiesError("No universities found. Ask admin to seed the universities collection.");
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Failed to load universities.";
+        setUniversitiesError(message);
+        toast.error(message);
+      } finally {
+        setUniversitiesLoading(false);
+      }
+    };
+
+    loadUniversities();
   }, []);
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -159,10 +177,11 @@ export default function RegisterPage() {
                 <Select
                   value={formData.universityId}
                   onValueChange={(value) => setFormData({ ...formData, universityId: value })}
+                  disabled={universitiesLoading || universities.length === 0}
                   required
                 >
                   <SelectTrigger id="university">
-                    <SelectValue placeholder="Select your university" />
+                    <SelectValue placeholder={universitiesLoading ? "Loading universities..." : "Select your university"} />
                   </SelectTrigger>
                   <SelectContent>
                     {universities.map((uni) => (
@@ -172,6 +191,37 @@ export default function RegisterPage() {
                     ))}
                   </SelectContent>
                 </Select>
+                {universitiesError && (
+                  <div className="rounded-md border border-red-200 bg-red-50 p-2 text-xs text-red-700">
+                    <p>{universitiesError}</p>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className="mt-2 h-7 px-2 text-xs"
+                      onClick={async () => {
+                        setUniversitiesLoading(true);
+                        setUniversitiesError(null);
+                        try {
+                          const data = await getUniversities();
+                          setUniversities(data);
+                          if (data.length === 0) {
+                            setUniversitiesError("No universities found. Ask admin to seed the universities collection.");
+                          }
+                        } catch (error) {
+                          const message =
+                            error instanceof Error ? error.message : "Failed to load universities.";
+                          setUniversitiesError(message);
+                          toast.error(message);
+                        } finally {
+                          setUniversitiesLoading(false);
+                        }
+                      }}
+                    >
+                      Retry
+                    </Button>
+                  </div>
+                )}
               </div>
 
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -238,7 +288,7 @@ export default function RegisterPage() {
               </div>
             </CardContent>
             <CardFooter className="flex flex-col gap-4">
-              <Button type="submit" className="w-full" disabled={loading}>
+              <Button type="submit" className="w-full" disabled={loading || universitiesLoading || universities.length === 0}>
                 {loading ? "Submitting..." : "Submit Registration"}
               </Button>
               <div className="text-center text-sm text-gray-600">
