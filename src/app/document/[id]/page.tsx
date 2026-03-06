@@ -1513,7 +1513,7 @@ export default function DocumentEditorPage() {
                     <div className="flex flex-wrap items-center gap-2">
                       <Button size="sm" variant="outline" onMouseDown={(e) => e.preventDefault()} onClick={handleUndo}><Undo2 className="mr-2 h-4 w-4" />Undo</Button>
                       <Button size="sm" variant="outline" onMouseDown={(e) => e.preventDefault()} onClick={handleRedo}><Redo2 className="mr-2 h-4 w-4" />Redo</Button>
-                      <Button size="sm" onClick={handleSave} disabled={!hasChanges}><Save className="mr-2 h-4 w-4" />Save Version</Button>
+                      <Button data-tour-id="document-save-version" size="sm" onClick={handleSave} disabled={!hasChanges}><Save className="mr-2 h-4 w-4" />Save Version</Button>
                     </div>
                   </TabsContent>
                 </Tabs>
@@ -1553,14 +1553,14 @@ export default function DocumentEditorPage() {
                   <div className="flex-1"><p className="text-sm font-medium">{collab.name}</p><p className="text-xs text-gray-500">{collab.role}</p></div>
                 </div>
               ))}
-              <Button variant="outline" size="sm" className="w-full" onClick={() => setInviteOpen(true)}><Share2 className="mr-2 h-4 w-4" />Invite</Button>
+              <Button data-tour-id="document-invite" variant="outline" size="sm" className="w-full" onClick={() => setInviteOpen(true)}><Share2 className="mr-2 h-4 w-4" />Invite</Button>
             </CardContent>
           </Card>
 
           <Card>
             <CardHeader><CardTitle>Actions</CardTitle></CardHeader>
             <CardContent className="space-y-2">
-              <Button variant="default" size="sm" className="w-full justify-start" onClick={() => setPublishOpen(true)}>
+              <Button data-tour-id="document-publish" variant="default" size="sm" className="w-full justify-start" onClick={() => setPublishOpen(true)}>
                 {publishVisibility === "public" ? <Globe className="mr-2 h-4 w-4 shrink-0" /> : <Lock className="mr-2 h-4 w-4 shrink-0" />}
                 Publish Research
               </Button>
@@ -1577,8 +1577,8 @@ export default function DocumentEditorPage() {
                 <span>Create Image Index <span className="block text-xs text-gray-500">Ctrl+Alt+I</span></span>
               </Button>
               <Button variant="outline" size="sm" className="w-full justify-start" onClick={() => setBranchOpen(true)}><GitBranch className="mr-2 h-4 w-4 shrink-0" />Create Branch</Button>
-              <Button variant="outline" size="sm" className="w-full justify-start" onClick={handleExportPdf}><Download className="mr-2 h-4 w-4 shrink-0" />Export PDF</Button>
-              <Button variant="outline" size="sm" className="w-full justify-start" onClick={() => setCommentsOpen(true)}><MessageSquare className="mr-2 h-4 w-4 shrink-0" />Comments ({comments.length})</Button>
+              <Button data-tour-id="document-export" variant="outline" size="sm" className="w-full justify-start" onClick={handleExportPdf}><Download className="mr-2 h-4 w-4 shrink-0" />Export PDF</Button>
+              <Button data-tour-id="document-comments" variant="outline" size="sm" className="w-full justify-start" onClick={() => setCommentsOpen(true)}><MessageSquare className="mr-2 h-4 w-4 shrink-0" />Comments ({comments.length})</Button>
             </CardContent>
           </Card>
 

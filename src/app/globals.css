@@ -61,6 +61,29 @@
   line-height: 1.7;
 }
 
+@keyframes tourPulse {
+  0%,
+  100% {
+    box-shadow:
+      0 0 0 2px rgba(125, 211, 252, 0.95),
+      0 0 0 10px rgba(56, 189, 248, 0.2);
+  }
+  50% {
+    box-shadow:
+      0 0 0 2px rgba(147, 197, 253, 1),
+      0 0 0 16px rgba(56, 189, 248, 0.28);
+  }
+}
+
+.tour-spotlight {
+  position: fixed;
+  z-index: 130;
+  border-radius: 12px;
+  pointer-events: none;
+  background: rgba(15, 23, 42, 0.08);
+  animation: tourPulse 1.4s ease-in-out infinite;
+}
+
 
 .dark {
   --background: oklch(0.145 0 0);

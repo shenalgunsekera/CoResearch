@@ -165,7 +165,7 @@ export default function AdminDashboard() {
           </CardHeader>
           <CardContent>
             <Tabs defaultValue="pending">
-              <TabsList>
+              <TabsList data-tour-id="admin-verification-tabs">
                 <TabsTrigger value="pending">
                   Pending ({pending.length})
                 </TabsTrigger>

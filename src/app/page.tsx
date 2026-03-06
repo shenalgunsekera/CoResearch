@@ -38,7 +38,7 @@ export default function LoginPage() {
     setLoading(true);
 
     try {
-      await login(email, password);
+      await login(email, password, role);
       toast.success("Login successful!");
       router.push("/dashboard");
     } catch (error) {
@@ -188,6 +188,5 @@ export default function LoginPage() {
     </div>
   );
 }
-
 
 

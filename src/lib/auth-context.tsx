@@ -19,7 +19,7 @@ import {
 
 interface AuthContextType {
   user: User | null;
-  login: (email: string, password: string) => Promise<void>;
+  login: (email: string, password: string, portal?: "student" | "university") => Promise<void>;
   register: (data: RegisterData) => Promise<void>;
   logout: () => Promise<void>;
   refreshUser: () => Promise<User | null>;
@@ -60,7 +60,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     return () => unsub();
   }, []);
 
-  const login = async (email: string, password: string) => {
+  const login = async (
+    email: string,
+    password: string,
+    portal: "student" | "university" = "student",
+  ) => {
     if (!auth) {
       throw new Error(firebaseEnvError ?? "Firebase is not configured.");
     }
@@ -72,6 +76,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
       if (!profile) {
         throw new Error("Account profile not found.");
+      }
+
+      if (portal === "university" && profile.role !== "admin") {
+        await signOut(auth);
+        throw new Error("Student accounts cannot log in from University Admin access.");
       }
 
       setUser(profile);

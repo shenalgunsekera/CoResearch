@@ -4,6 +4,7 @@ import { AuthProvider } from "@/lib/auth-context";
 import { Toaster } from "@/components/ui/sonner";
 import { AppStartupSplash } from "@/components/app-startup-splash";
 import { VerificationGate } from "@/components/verification-gate";
+import { ProductTour } from "@/components/product-tour";
 
 export const metadata: Metadata = {
   title: "CoResearch - Collaborative Research Platform",
@@ -22,6 +23,7 @@ export default function RootLayout({
         <AppStartupSplash />
         <AuthProvider>
           <VerificationGate />
+          <ProductTour />
           <main className="min-h-screen">{children}</main>
           <Toaster />
         </AuthProvider>

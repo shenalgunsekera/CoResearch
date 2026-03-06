@@ -166,6 +166,7 @@ export default function DiscoverPage() {
               <Button
                 variant="ghost"
                 size="sm"
+                data-tour-id="discover-back"
                 onClick={() => router.push("/dashboard")}
               >
                 <ArrowLeft className="w-4 h-4 mr-2" />
@@ -194,11 +195,11 @@ export default function DiscoverPage() {
       <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
         <Tabs defaultValue="projects" className="w-full">
           <TabsList>
-            <TabsTrigger value="projects">
+            <TabsTrigger value="projects" data-tour-id="discover-projects-tab">
               <BookOpen className="w-4 h-4 mr-2" />
               Browse Projects
             </TabsTrigger>
-            <TabsTrigger value="chat">
+            <TabsTrigger value="chat" data-tour-id="discover-chat-tab">
               <MessageSquare className="w-4 h-4 mr-2" />
               Knowledge Sharing
             </TabsTrigger>
@@ -218,6 +219,7 @@ export default function DiscoverPage() {
                   <div className="flex-1 relative">
                     <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 w-4 h-4 text-gray-400" />
                     <Input
+                      data-tour-id="discover-search-input"
                       placeholder="Search projects by title or topic..."
                       className="pl-10"
                       value={searchQuery}
@@ -320,6 +322,7 @@ export default function DiscoverPage() {
                               <Button
                                 size="sm"
                                 variant="outline"
+                                data-tour-id="discover-request-join"
                                 onClick={handleRequestJoin}
                               >
                                 Request to Join
@@ -404,6 +407,7 @@ export default function DiscoverPage() {
                       onChange={handleUploadChatImage}
                     />
                     <Input
+                      data-tour-id="discover-chat-input"
                       placeholder="Type your message..."
                       value={chatMessage}
                       onChange={(e) => setChatMessage(e.target.value)}

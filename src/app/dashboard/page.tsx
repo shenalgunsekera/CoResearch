@@ -25,10 +25,15 @@ import {
   Settings,
   Compass,
   Trash2,
+  Rocket,
+  Sparkles,
 } from "lucide-react";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { toast } from "sonner";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { completeProductTourForUser, startProductTour } from "@/components/product-tour";
+
+const ONBOARDING_STORAGE_KEY = "coresearch:onboarding:v2";
 
 export default function DashboardPage() {
   const { user, logout, isAdmin, isLoading } = useAuth();
@@ -40,6 +45,8 @@ export default function DashboardPage() {
   const [deleteTarget, setDeleteTarget] = useState<Document | null>(null);
   const [deleteConfirmText, setDeleteConfirmText] = useState("");
   const [deleting, setDeleting] = useState(false);
+  const [showGuideNudge, setShowGuideNudge] = useState(false);
+  const [guideStateReady, setGuideStateReady] = useState(false);
 
   useEffect(() => {
     if (!isLoading && !user) {
@@ -61,6 +68,17 @@ export default function DashboardPage() {
 
     loadDocuments();
   }, [user]);
+
+  useEffect(() => {
+    if (!user || loadingDocs) return;
+
+    const storageKey = `${ONBOARDING_STORAGE_KEY}:${user.id}`;
+    const completed = localStorage.getItem(storageKey) === "completed";
+    const shouldNudge = !completed && documents.length === 0;
+
+    setShowGuideNudge(shouldNudge);
+    setGuideStateReady(true);
+  }, [documents.length, loadingDocs, user]);
 
   if (isLoading || !user) {
     return null;
@@ -112,6 +130,13 @@ export default function DashboardPage() {
     }
   };
 
+  const skipGuide = () => {
+    if (!user) return;
+    completeProductTourForUser(user.id);
+    setShowGuideNudge(false);
+    toast.message("Guide skipped. You can reopen it from the Guide button.");
+  };
+
   return (
     <div className="min-h-screen bg-gray-50">
       {/* Header */}
@@ -126,6 +151,16 @@ export default function DashboardPage() {
               <Button
                 variant="ghost"
                 size="sm"
+                data-tour-id="dashboard-guide"
+                onClick={startProductTour}
+              >
+                <Sparkles className="w-4 h-4 mr-2" />
+                Guide
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                data-tour-id="dashboard-discover"
                 onClick={() => router.push("/discover")}
               >
                 <Compass className="w-4 h-4 mr-2" />
@@ -174,6 +209,31 @@ export default function DashboardPage() {
             Continue your research collaboration or start a new project.
           </p>
         </div>
+
+        {guideStateReady && showGuideNudge && (
+          <Card className="mb-8 overflow-hidden border-0 bg-gradient-to-r from-slate-900 via-blue-900 to-cyan-900 text-white shadow-lg">
+            <CardContent className="flex flex-col gap-4 p-6 md:flex-row md:items-center md:justify-between">
+              <div className="space-y-2">
+                <p className="inline-flex w-fit items-center gap-2 rounded-full border border-white/30 bg-white/10 px-3 py-1 text-xs uppercase tracking-wide">
+                  <Rocket className="h-3.5 w-3.5" />
+                  New here?
+                </p>
+                <h3 className="text-2xl font-semibold">Take the 2-minute interactive product guide</h3>
+                <p className="max-w-2xl text-sm text-white/85">
+                  Learn how to create papers, use the smart editor, publish to Discover, and collaborate with your university.
+                </p>
+              </div>
+              <div className="flex shrink-0 flex-wrap gap-2">
+                <Button className="bg-white text-slate-900 hover:bg-white/90" onClick={startProductTour}>
+                  Start Guide
+                </Button>
+                <Button variant="ghost" className="text-white hover:bg-white/15 hover:text-white" onClick={skipGuide}>
+                  Skip
+                </Button>
+              </div>
+            </CardContent>
+          </Card>
+        )}
 
         {/* Stats */}
         <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
@@ -236,7 +296,7 @@ export default function DashboardPage() {
               onChange={(e) => setSearchQuery(e.target.value)}
             />
           </div>
-          <Button onClick={() => router.push("/document/new")}>
+          <Button data-tour-id="dashboard-new-paper" onClick={() => router.push("/document/new")}>
             <Plus className="w-4 h-4 mr-2" />
             New Research Paper
           </Button>

@@ -7,16 +7,25 @@ import loadingAnimation from "@/app/animations/loadinganimation.gif";
 
 const SPLASH_DURATION_MS = 2200;
 const EXIT_DURATION_MS = 350;
+const SPLASH_SEEN_KEY = "coresearch:splash:seen";
 
 export function AppStartupSplash() {
-  const pathname = usePathname();
+  usePathname();
   const [visible, setVisible] = useState(false);
   const [exiting, setExiting] = useState(false);
+  const hasInitializedRef = useRef(false);
   const showTimerRef = useRef<number | null>(null);
   const hideTimerRef = useRef<number | null>(null);
   const exitTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
+    if (hasInitializedRef.current) return;
+    hasInitializedRef.current = true;
+
+    const alreadySeen = sessionStorage.getItem(SPLASH_SEEN_KEY) === "1";
+    if (alreadySeen) return;
+    sessionStorage.setItem(SPLASH_SEEN_KEY, "1");
+
     if (showTimerRef.current) window.clearTimeout(showTimerRef.current);
     if (hideTimerRef.current) window.clearTimeout(hideTimerRef.current);
     if (exitTimerRef.current) window.clearTimeout(exitTimerRef.current);
@@ -36,7 +45,7 @@ export function AppStartupSplash() {
       if (hideTimerRef.current) window.clearTimeout(hideTimerRef.current);
       if (exitTimerRef.current) window.clearTimeout(exitTimerRef.current);
     };
-  }, [pathname]);
+  }, []);
 
   if (!visible) return null;
 
