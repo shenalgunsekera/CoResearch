@@ -90,6 +90,18 @@ service cloud.firestore {
         request.auth.uid == resource.data.ownerId;
     }
 
+    match /mergeRequests/{mergeRequestId} {
+      // Branch author can create; parent doc owner or branch author can read/update
+      allow create: if signedIn() &&
+        request.resource.data.authorId == request.auth.uid;
+
+      allow read: if signedIn();
+
+      allow update: if signedIn();
+
+      allow delete: if false;
+    }
+
     match /chatMessages/{messageId} {
       allow read: if signedIn() &&
         resource.data.university == currentUser().data.university.name;

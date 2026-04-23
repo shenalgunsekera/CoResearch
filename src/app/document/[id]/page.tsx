@@ -1,16 +1,18 @@
 "use client";
 
-import { type ChangeEvent, useEffect, useMemo, useRef, useState } from "react";
-import { useParams, useRouter } from "next/navigation";
+import { type ChangeEvent, type MouseEvent as ReactMouseEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useParams, useRouter, useSearchParams } from "next/navigation";
 import NextImage from "next/image";
 import { useAuth } from "@/lib/auth-context";
 import { type Comment, type Document, type User, type Version } from "@/lib/types";
 import {
   addCommentToDocument,
   createDocument,
+  getBranchDocumentsForParent,
   getCommentsForDocument,
   getDocumentById,
   getUserByEmail,
+  subscribeToDocumentById,
   updateDocument,
 } from "@/lib/firestore";
 import { deleteDocumentImageByUrl, isFirebaseStorageUrl, uploadDocumentCover, uploadDocumentImage } from "@/lib/storage";
@@ -29,8 +31,13 @@ import {
   Bold, Italic, Heading1, Heading2, Heading3, List, ListOrdered, Link2, Quote, Code2, Palette, Type, ImagePlus, Trash2,
   Strikethrough, Undo2, Redo2, Minus,
   Globe, Lock,
+  AlignLeft, AlignCenter, AlignRight,
+  ArrowUp, ArrowDown, ChevronLeft, ChevronRight,
+  RotateCcw, GitCommit, Eye, CheckCircle2,
+  GitMerge, AlertTriangle, Check, X,
 } from "lucide-react";
 import { EditorContent, useEditor } from "@tiptap/react";
+import { BubbleMenu } from "@tiptap/react/menus";
 import { Extension } from "@tiptap/core";
 import StarterKit from "@tiptap/starter-kit";
 import Link from "@tiptap/extension-link";
@@ -169,6 +176,15 @@ function escapeHtml(value: string) {
     .replaceAll("'", "&#39;");
 }
 
+function userCanOpenDocument(document: Document, user: User) {
+  return (
+    document.ownerId === user.id ||
+    user.role === "admin" ||
+    document.collaborators.some((collab) => collab.id === user.id) ||
+    (document.stage === "published" && (document.publishVisibility ?? "public") === "public")
+  );
+}
+
 function stripGeneratedSection(doc: globalThis.Document, blockType: "toc" | "image-index") {
   doc.querySelectorAll(`section[data-report-block="${blockType}"]`).forEach((el) => el.remove());
 }
@@ -288,6 +304,229 @@ function buildResearchReportTemplate() {
   `;
 }
 
+// ── Merge diff utilities ──────────────────────────────────────────────────────
+
+interface HtmlBlock {
+  html: string;
+  text: string;
+}
+
+function splitHtmlBlocks(html: string): HtmlBlock[] {
+  const parts = html
+    .replace(/>\s+</g, "><")
+    .split(/(?<=<\/(?:p|h[1-6]|li|blockquote|pre)>)/i)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (parts.length === 0) {
+    const text = html.replace(/<[^>]+>/g, "").replace(/&nbsp;/g, " ").trim();
+    return [{ html, text }];
+  }
+  return parts.map((h) => ({
+    html: h,
+    text: h.replace(/<[^>]+>/g, "").replace(/&nbsp;/g, " ").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").trim(),
+  }));
+}
+
+function lcsDp(a: string[], b: string[]): number[][] {
+  const m = a.length, n = b.length;
+  const dp: number[][] = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+  for (let i = 1; i <= m; i++)
+    for (let j = 1; j <= n; j++)
+      dp[i][j] = a[i - 1] === b[j - 1] ? dp[i - 1][j - 1] + 1 : Math.max(dp[i - 1][j], dp[i][j - 1]);
+  return dp;
+}
+
+export type MergeBlockStatus = "unchanged" | "branch-add" | "parent-only" | "conflict";
+
+export interface MergeBlock {
+  status: MergeBlockStatus;
+  html: string;
+  text: string;
+  branchHtml?: string;
+  branchText?: string;
+  idx: number;
+}
+
+function threeWayDiff(ancestorHtml: string, parentHtml: string, branchHtml: string): MergeBlock[] {
+  const ancestor = splitHtmlBlocks(ancestorHtml);
+  const parent   = splitHtmlBlocks(parentHtml);
+  const branch   = splitHtmlBlocks(branchHtml);
+
+  const aTexts = ancestor.map((b) => b.text);
+  const pTexts = parent.map((b) => b.text);
+  const brTexts = branch.map((b) => b.text);
+
+  // Which ancestor lines are still in parent / branch
+  function survivingAncestorIndices(aT: string[], bT: string[]): Set<number> {
+    const dp = lcsDp(aT, bT);
+    const surviving = new Set<number>();
+    let i = aT.length, j = bT.length;
+    while (i > 0 && j > 0) {
+      if (aT[i - 1] === bT[j - 1]) { surviving.add(i - 1); i--; j--; }
+      else if (dp[i - 1][j] >= dp[i][j - 1]) i--;
+      else j--;
+    }
+    return surviving;
+  }
+
+  const inParent = survivingAncestorIndices(aTexts, pTexts);
+  const inBranch = survivingAncestorIndices(aTexts, brTexts);
+
+  // 2-way diff: parent vs branch blocks
+  const dp = lcsDp(pTexts, brTexts);
+  const raw: { type: "same" | "p-only" | "br-only"; pIdx: number; brIdx: number }[] = [];
+  let pi = pTexts.length, bri = brTexts.length;
+  while (pi > 0 || bri > 0) {
+    if (pi > 0 && bri > 0 && pTexts[pi - 1] === brTexts[bri - 1]) {
+      raw.push({ type: "same", pIdx: pi - 1, brIdx: bri - 1 });
+      pi--; bri--;
+    } else if (bri > 0 && (pi === 0 || dp[pi][bri - 1] >= dp[pi - 1][bri])) {
+      raw.push({ type: "br-only", pIdx: -1, brIdx: bri - 1 });
+      bri--;
+    } else {
+      raw.push({ type: "p-only", pIdx: pi - 1, brIdx: -1 });
+      pi--;
+    }
+  }
+  raw.reverse();
+
+  const blocks: MergeBlock[] = [];
+  let idx = 0;
+  let i = 0;
+  while (i < raw.length) {
+    const cur = raw[i];
+    if (cur.type === "same") {
+      blocks.push({ status: "unchanged", html: parent[cur.pIdx].html, text: parent[cur.pIdx].text, idx: idx++ });
+      i++;
+    } else if (cur.type === "p-only" && i + 1 < raw.length && raw[i + 1].type === "br-only") {
+      // Adjacent parent-only + branch-only = conflict
+      const pb = parent[cur.pIdx];
+      const brb = branch[raw[i + 1].brIdx];
+      // Check if ancestor actually had the parent block (parent changed it) AND branch changed it too
+      const ancestorHadIt = inParent.size > 0 || inBranch.size > 0;
+      if (ancestorHadIt) {
+        blocks.push({ status: "conflict", html: pb.html, text: pb.text, branchHtml: brb.html, branchText: brb.text, idx: idx++ });
+      } else {
+        blocks.push({ status: "parent-only", html: pb.html, text: pb.text, idx: idx++ });
+        blocks.push({ status: "branch-add", html: brb.html, text: brb.text, idx: idx++ });
+      }
+      i += 2;
+    } else if (cur.type === "br-only" && i + 1 < raw.length && raw[i + 1].type === "p-only") {
+      // branch-only then parent-only = conflict
+      const brb = branch[cur.brIdx];
+      const pb = parent[raw[i + 1].pIdx];
+      blocks.push({ status: "conflict", html: pb.html, text: pb.text, branchHtml: brb.html, branchText: brb.text, idx: idx++ });
+      i += 2;
+    } else if (cur.type === "br-only") {
+      blocks.push({ status: "branch-add", html: branch[cur.brIdx].html, text: branch[cur.brIdx].text, idx: idx++ });
+      i++;
+    } else {
+      // p-only
+      blocks.push({ status: "parent-only", html: parent[cur.pIdx].html, text: parent[cur.pIdx].text, idx: idx++ });
+      i++;
+    }
+  }
+  return blocks;
+}
+
+function buildMergedHtml(blocks: MergeBlock[], resolutions: Map<number, "parent" | "branch">): string {
+  return blocks
+    .map((b) => {
+      if (b.status === "unchanged") return b.html;
+      if (b.status === "parent-only") return b.html;
+      if (b.status === "branch-add") return b.html;
+      // conflict
+      const res = resolutions.get(b.idx) ?? "parent";
+      return res === "branch" ? (b.branchHtml ?? b.html) : b.html;
+    })
+    .join("");
+}
+
+type AiDiffSegmentType = "unchanged" | "add" | "remove" | "replace";
+
+interface AiDiffSegment {
+  type: AiDiffSegmentType;
+  value: string;
+  nextValue?: string;
+}
+
+interface AiPreviewState {
+  from: number;
+  to: number;
+  selectedText: string;
+  output: string;
+  segments: AiDiffSegment[];
+}
+
+interface AiSelectionState {
+  from: number;
+  to: number;
+  selectedText: string;
+}
+
+function tokenizeDiffText(value: string): string[] {
+  return value.match(/\s+|[^\s]+/g) ?? [];
+}
+
+function buildAiDiffSegments(before: string, after: string): AiDiffSegment[] {
+  const beforeTokens = tokenizeDiffText(before);
+  const afterTokens = tokenizeDiffText(after);
+  const dp = lcsDp(beforeTokens, afterTokens);
+  const raw: { type: "same" | "remove" | "add"; value: string }[] = [];
+
+  let i = beforeTokens.length;
+  let j = afterTokens.length;
+  while (i > 0 || j > 0) {
+    if (i > 0 && j > 0 && beforeTokens[i - 1] === afterTokens[j - 1]) {
+      raw.push({ type: "same", value: beforeTokens[i - 1] });
+      i--;
+      j--;
+    } else if (j > 0 && (i === 0 || dp[i][j - 1] >= dp[i - 1][j])) {
+      raw.push({ type: "add", value: afterTokens[j - 1] });
+      j--;
+    } else {
+      raw.push({ type: "remove", value: beforeTokens[i - 1] });
+      i--;
+    }
+  }
+
+  raw.reverse();
+
+  const segments: AiDiffSegment[] = [];
+  let cursor = 0;
+  while (cursor < raw.length) {
+    if (raw[cursor].type === "same") {
+      let value = "";
+      while (cursor < raw.length && raw[cursor].type === "same") {
+        value += raw[cursor].value;
+        cursor++;
+      }
+      segments.push({ type: "unchanged", value });
+      continue;
+    }
+
+    let removed = "";
+    let added = "";
+    while (cursor < raw.length && raw[cursor].type !== "same") {
+      if (raw[cursor].type === "remove") removed += raw[cursor].value;
+      if (raw[cursor].type === "add") added += raw[cursor].value;
+      cursor++;
+    }
+
+    if (removed && added) {
+      segments.push({ type: "replace", value: removed, nextValue: added });
+    } else if (removed) {
+      segments.push({ type: "remove", value: removed });
+    } else if (added) {
+      segments.push({ type: "add", value: added });
+    }
+  }
+
+  return segments;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 function applyLocalPrompt(prompt: string, selectedText: string) {
   const instruction = prompt.trim().toLowerCase();
   const cleanText = selectedText.trim();
@@ -402,6 +641,9 @@ export default function DocumentEditorPage() {
   const isNewDocument = id === "new";
   const { user, isLoading } = useAuth();
   const router = useRouter();
+  const searchParams = useSearchParams();
+  const isPublishedView = searchParams.get("view") === "published";
+  const shouldAutoDownloadPdf = searchParams.get("download") === "1";
 
   const imageInputRef = useRef<HTMLInputElement | null>(null);
   const quillHostRef = useRef<HTMLDivElement | null>(null);
@@ -410,6 +652,8 @@ export default function DocumentEditorPage() {
   const quillLatestHtmlRef = useRef("<p></p>");
   const editorModeRef = useRef<"quill" | "tiptap">("tiptap");
   const autosaveCreatingRef = useRef(false);
+  const latestLocalEditAtRef = useRef(0);
+  const pdfAutoDownloadStartedRef = useRef(false);
   const selectedImageRef = useRef<HTMLImageElement | null>(null);
   const [persistedDocument, setPersistedDocument] = useState<Document | null>(null);
   const [titleDraft, setTitleDraft] = useState<string | null>(null);
@@ -433,6 +677,9 @@ export default function DocumentEditorPage() {
   const [linkUrl, setLinkUrl] = useState("https://");
   const [aiDialogOpen, setAiDialogOpen] = useState(false);
   const [aiPrompt, setAiPrompt] = useState("");
+  const [aiLoading, setAiLoading] = useState(false);
+  const [aiSelection, setAiSelection] = useState<AiSelectionState | null>(null);
+  const [aiPreview, setAiPreview] = useState<AiPreviewState | null>(null);
 
   const [inviteOpen, setInviteOpen] = useState(false);
   const [inviteEmail, setInviteEmail] = useState("");
@@ -441,6 +688,20 @@ export default function DocumentEditorPage() {
   const [branchOpen, setBranchOpen] = useState(false);
   const [branchName, setBranchName] = useState("");
   const [branchLoading, setBranchLoading] = useState(false);
+  const [commitOpen, setCommitOpen] = useState(false);
+  const [commitMessage, setCommitMessage] = useState("");
+  const [parentDocTitle, setParentDocTitle] = useState<string | null>(null);
+  // Merge — branch documents act as merge requests themselves
+  const [branchDocs, setBranchDocs] = useState<Document[]>([]);
+  const [mergeRequestOpen, setMergeRequestOpen] = useState(false);
+  const [mergeRequestMsg, setMergeRequestMsg] = useState("");
+  const [mergeRequestLoading, setMergeRequestLoading] = useState(false);
+  // Merge review (parent sees incoming requests)
+  const [mergeReviewOpen, setMergeReviewOpen] = useState(false);
+  const [activeBranchDoc, setActiveBranchDoc] = useState<Document | null>(null);
+  const [mergeDiffBlocks, setMergeDiffBlocks] = useState<MergeBlock[]>([]);
+  const [mergeResolutions, setMergeResolutions] = useState<Map<number, "parent" | "branch">>(new Map());
+  const [mergeApplying, setMergeApplying] = useState(false);
   const [publishOpen, setPublishOpen] = useState(false);
   const [publishVisibility, setPublishVisibility] = useState<"public" | "private">("public");
   const [publishAbstract, setPublishAbstract] = useState("");
@@ -465,7 +726,28 @@ export default function DocumentEditorPage() {
   const currentImageUrls = useMemo(() => extractImageUrlsFromHtml(effectiveContent), [effectiveContent]);
   const allImageUrls = useMemo(() => uniqueUrls([...currentImageUrls, ...trackedImageUrls]), [currentImageUrls, trackedImageUrls]);
   const hasChanges = effectiveTitle !== baseTitle || effectiveContent !== baseContent;
-  const canEdit = !!user;
+  const collaboratorRole = user ? collaborators.find((collab) => collab.id === user.id)?.role : undefined;
+  const canManageDocument = !!document && !!user && (document.ownerId === user.id || user.role === "admin");
+  const hasEditorRole = !!document && !!user && (canManageDocument || collaboratorRole === "editor" || collaboratorRole === "owner");
+  const isDiscoverReadOnlyView =
+    !!document &&
+    isPublishedView &&
+    document.stage === "published" &&
+    (document.publishVisibility ?? "public") === "public";
+  const canEdit = !!user && hasEditorRole && !isDiscoverReadOnlyView;
+  const canInvite = canManageDocument && !isDiscoverReadOnlyView;
+  const canPublish = !!document && canManageDocument && !isNewDocument && !document.parentDocumentId && !isDiscoverReadOnlyView;
+  const canCreateBranch = !!document && !document.parentDocumentId && hasEditorRole && !isDiscoverReadOnlyView;
+  const canComment = !!document && !!user && !isNewDocument && !isDiscoverReadOnlyView;
+  const canViewDocument =
+    !!document &&
+    !!user &&
+    (
+      document.ownerId === user.id ||
+      user.role === "admin" ||
+      collaborators.some((collab) => collab.id === user.id) ||
+      (document.stage === "published" && (document.publishVisibility ?? "public") === "public")
+    );
 
   useEffect(() => {
     quillLatestHtmlRef.current = effectiveContent || baseContent || "<p></p>";
@@ -508,8 +790,18 @@ export default function DocumentEditorPage() {
       Color,
     ],
     content: baseContent,
-    onUpdate: ({ editor: e }) => setEditorHtml(e.getHTML()),
+    editable: canEdit,
+    onUpdate: ({ editor: e }) => {
+      if (!canEdit) return;
+      latestLocalEditAtRef.current = Date.now();
+      setEditorHtml(e.getHTML());
+    },
   });
+
+  useEffect(() => {
+    if (!editor) return;
+    editor.setEditable(canEdit);
+  }, [canEdit, editor]);
 
   useEffect(() => {
     if (!editor) return;
@@ -544,6 +836,7 @@ export default function DocumentEditorPage() {
       const QuillCtor = module.default;
       const quill = new QuillCtor(host, {
         theme: "snow",
+        readOnly: !canEdit,
         modules: {
           toolbar: {
             container: QUILL_TOOLBAR_CONFIG,
@@ -556,6 +849,8 @@ export default function DocumentEditorPage() {
 
       quill.clipboard.dangerouslyPasteHTML(quillLatestHtmlRef.current || "<p></p>");
       quill.on("text-change", () => {
+        if (!canEdit) return;
+        latestLocalEditAtRef.current = Date.now();
         quillSyncGuardRef.current = true;
         setEditorHtml(quill.root.innerHTML);
       });
@@ -584,7 +879,15 @@ export default function DocumentEditorPage() {
       cancelled = true;
       quillInstanceRef.current = null;
     };
-  }, [editorMode]);
+  }, [canEdit, editorMode]);
+
+  useEffect(() => {
+    const quill = quillInstanceRef.current;
+    if (!quill) return;
+    if ("enable" in quill && typeof (quill as QuillInstance & { enable?: (enabled: boolean) => void }).enable === "function") {
+      (quill as QuillInstance & { enable: (enabled: boolean) => void }).enable(canEdit);
+    }
+  }, [canEdit]);
 
   useEffect(() => {
     if (editorMode !== "quill") return;
@@ -619,6 +922,7 @@ export default function DocumentEditorPage() {
     if (!editor || editorMode !== "tiptap") return;
     const root = editor.view.dom as HTMLElement;
     const handleEditorClick = (event: Event) => {
+      if (!canEdit) return;
       const target = event.target;
       if (!(target instanceof HTMLImageElement)) return;
       selectedImageRef.current = target;
@@ -632,6 +936,7 @@ export default function DocumentEditorPage() {
     };
 
     const handleImageDragStart = (event: MouseEvent) => {
+      if (!canEdit) return;
       const target = event.target;
       if (!(target instanceof HTMLImageElement)) return;
       event.preventDefault();
@@ -679,31 +984,66 @@ export default function DocumentEditorPage() {
       root.removeEventListener("click", handleEditorClick);
       root.removeEventListener("mousedown", handleImageDragStart);
     };
-  }, [editor, editorMode]);
+  }, [canEdit, editor, editorMode]);
 
   useEffect(() => {
     if (isLoading) return;
     if (!user) return router.push("/");
     if (isNewDocument) return;
 
-    async function loadDocument() {
-      try {
-        const existingDoc = await getDocumentById(id);
+    const unsubscribe = subscribeToDocumentById(
+      id,
+      (existingDoc) => {
         if (!existingDoc) {
           toast.error("Document not found.");
           router.push("/dashboard");
           return;
         }
+        if (!userCanOpenDocument(existingDoc, user)) {
+          toast.error("You do not have access to this document.");
+          router.push("/dashboard");
+          return;
+        }
+
         setPersistedDocument(existingDoc);
-        setTitleDraft(existingDoc.title);
-        setEditorHtml(markdownToBasicHtml(existingDoc.content));
+
+        const remoteHtml = markdownToBasicHtml(existingDoc.content);
+        const hasVeryRecentLocalEdit = Date.now() - latestLocalEditAtRef.current < 3000;
+        if (!hasVeryRecentLocalEdit) {
+          setTitleDraft(existingDoc.title);
+          setEditorHtml(remoteHtml);
+          if (editorModeRef.current === "quill") {
+            quillInstanceRef.current?.clipboard.dangerouslyPasteHTML(remoteHtml);
+          } else {
+            editor?.commands.setContent(remoteHtml, { emitUpdate: false });
+          }
+        }
+      },
+      () => {
+        toast.error("Realtime document sync failed.");
+      },
+    );
+
+    async function loadDocumentMetadata() {
+      // Load branch docs + parent title separately — non-critical
+      try {
+        const loadedDoc = await getDocumentById(id);
+        if (loadedDoc?.parentDocumentId) {
+          // On a branch: fetch parent title
+          const parentDoc = await getDocumentById(loadedDoc.parentDocumentId);
+          if (parentDoc) setParentDocTitle(parentDoc.title);
+        } else if (loadedDoc) {
+          // On a parent: load all branch documents
+          const branches = await getBranchDocumentsForParent(loadedDoc.id);
+          setBranchDocs(branches);
+        }
       } catch {
-        toast.error("Failed to load document.");
-        router.push("/dashboard");
+        // Silently ignore
       }
     }
-    void loadDocument();
-  }, [id, isLoading, isNewDocument, router, user]);
+    void loadDocumentMetadata();
+    return () => unsubscribe();
+  }, [editor, id, isLoading, isNewDocument, router, user]);
 
   useEffect(() => {
     if (!commentsOpen || isNewDocument) return;
@@ -796,29 +1136,90 @@ export default function DocumentEditorPage() {
     setLinkUrl("https://");
   };
 
-  const handleRunPrompt = () => {
+  const handleOpenAiDialog = () => {
+    if (editorMode === "quill") return toast.info("Prompt Assistant works in Structured mode.");
+    if (!editor) return;
+    const { from, to, empty } = editor.state.selection;
+    if (empty) return toast.error("Select text first, then open AI.");
+
+    setAiSelection({
+      from,
+      to,
+      selectedText: editor.state.doc.textBetween(from, to, "\n"),
+    });
+    setAiPreview(null);
+    setAiDialogOpen(true);
+  };
+
+  const preventEditorBlur = (event: ReactMouseEvent<HTMLButtonElement>) => {
+    event.preventDefault();
+  };
+
+  const handleRunPrompt = async () => {
     if (editorMode === "quill") return toast.info("Prompt Assistant works in Structured mode.");
     if (!editor) return;
     const instruction = aiPrompt.trim();
     if (!instruction) return toast.error("Enter a prompt.");
 
-    const { from, to, empty } = editor.state.selection;
-    if (empty) return toast.error("Select text first, then run a prompt.");
+    const currentSelection = aiSelection ?? (() => {
+      const { from, to, empty } = editor.state.selection;
+      if (empty) return null;
+      return {
+        from,
+        to,
+        selectedText: editor.state.doc.textBetween(from, to, "\n"),
+      };
+    })();
+    if (!currentSelection) return toast.error("Select text first, then run a prompt.");
 
-    const selectedText = editor.state.doc.textBetween(from, to, "\n");
-    const output = applyLocalPrompt(instruction, selectedText);
-    if (!output || output === selectedText) {
-      toast.info("No changes made. Try a clearer prompt like: summarize, expand, title case.");
-      return;
+    setAiLoading(true);
+    try {
+      const res = await fetch("/api/ai/prompt", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt: instruction, selectedText: currentSelection.selectedText }),
+      });
+
+      if (!res.ok) {
+        const { error } = await res.json().catch(() => ({ error: "Unknown error" }));
+        toast.error(error ?? "AI request failed.");
+        return;
+      }
+
+      const { output } = await res.json();
+      if (!output || output === currentSelection.selectedText) {
+        setAiPreview(null);
+        toast.info("No changes made.");
+        return;
+      }
+
+      setAiPreview({
+        from: currentSelection.from,
+        to: currentSelection.to,
+        selectedText: currentSelection.selectedText,
+        output,
+        segments: buildAiDiffSegments(currentSelection.selectedText, output),
+      });
+      toast.success("Preview ready. Confirm edits to apply them.");
+    } catch {
+      toast.error("Failed to reach AI service. Check your connection.");
+    } finally {
+      setAiLoading(false);
     }
+  };
 
-    editor.chain().focus().insertContentAt({ from, to }, output).run();
+  const handleConfirmAiEdits = () => {
+    if (!editor || !aiPreview) return;
+    editor.chain().focus().setTextSelection({ from: aiPreview.from, to: aiPreview.to }).insertContent(aiPreview.output).run();
+    setAiSelection(null);
+    setAiPreview(null);
     setAiDialogOpen(false);
     setAiPrompt("");
-    toast.success("Prompt applied.");
+    toast.success("AI edits applied.");
   };
 
   const handleApplyFont = () => {
+    if (!canEdit) return;
     if (editorMode === "quill") return toast.info("Use font controls in the Full Toolbar.");
     if (!editor) return;
     const font = (customFont || selectedFont).trim();
@@ -834,6 +1235,7 @@ export default function DocumentEditorPage() {
   };
 
   const handleApplyFontSize = () => {
+    if (!canEdit) return;
     if (editorMode === "quill") return;
     if (!editor) return;
     const size = selectedFontSize.trim();
@@ -851,24 +1253,28 @@ export default function DocumentEditorPage() {
   };
 
   const handleApplyColor = () => {
+    if (!canEdit) return;
     if (editorMode === "quill") return toast.info("Use color controls in the Full Toolbar.");
     if (!editor) return;
     editor.chain().focus().setColor(selectedColor).run();
   };
 
   const handleUndo = () => {
+    if (!canEdit) return;
     if (!editor) return;
     const ok = editor.chain().focus().undo().run();
     if (!ok) toast.info("Nothing to undo.");
   };
 
   const handleRedo = () => {
+    if (!canEdit) return;
     if (!editor) return;
     const ok = editor.chain().focus().redo().run();
     if (!ok) toast.info("Nothing to redo.");
   };
 
   const handleInsertReportTemplate = () => {
+    if (!canEdit) return;
     const template = buildResearchReportTemplate();
     if (editorMode === "quill") {
       quillInstanceRef.current?.clipboard.dangerouslyPasteHTML(template);
@@ -882,6 +1288,7 @@ export default function DocumentEditorPage() {
   };
 
   const handleCreateTableOfContents = () => {
+    if (!canEdit) return;
     const currentHtml = editorMode === "quill"
       ? quillInstanceRef.current?.root.innerHTML || effectiveContent
       : editor?.getHTML() ?? effectiveContent;
@@ -897,6 +1304,7 @@ export default function DocumentEditorPage() {
   };
 
   const handleCreateImageIndex = () => {
+    if (!canEdit) return;
     const sourceHtml = editorMode === "quill"
       ? quillInstanceRef.current?.root.innerHTML || effectiveContent
       : editor?.getHTML() ?? effectiveContent;
@@ -915,7 +1323,7 @@ export default function DocumentEditorPage() {
   const handleImageUpload = async (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     event.target.value = "";
-    if (!file || !user || !document) return;
+    if (!file || !user || !document || !canEdit) return;
     if (!file.type.startsWith("image/")) return toast.error("Please upload an image.");
     if (file.size > 5 * 1024 * 1024) return toast.error("Image must be smaller than 5MB.");
 
@@ -946,6 +1354,7 @@ export default function DocumentEditorPage() {
   };
 
   const handleInsertExistingImage = (url: string) => {
+    if (!canEdit) return;
     if (editorMode === "quill") {
       const quill = quillInstanceRef.current;
       if (!quill) return;
@@ -963,6 +1372,7 @@ export default function DocumentEditorPage() {
   };
 
   const handleApplySelectedImageStyle = (nextWidth: number, nextAlign: ImageAlign) => {
+    if (!canEdit) return;
     const img = selectedImageRef.current;
     if (!img || !img.isConnected) {
       setImageEditorOpen(false);
@@ -1003,6 +1413,7 @@ export default function DocumentEditorPage() {
   };
 
   const handleMoveSelectedImage = (direction: "up" | "down") => {
+    if (!canEdit) return;
     const img = selectedImageRef.current;
     if (!img || !img.isConnected) return toast.error("Select an image inside the document first.");
 
@@ -1033,6 +1444,7 @@ export default function DocumentEditorPage() {
   };
 
   const handleRemoveImage = async (url: string) => {
+    if (!canEdit) return;
     const escaped = url.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const nextHtml = effectiveContent.replace(new RegExp(`<img[^>]+src=["']${escaped}["'][^>]*>`, "g"), "");
     setEditorHtml(nextHtml);
@@ -1051,7 +1463,7 @@ export default function DocumentEditorPage() {
     }
   };
 
-  const handleSave = async () => {
+  const handleSave = async (msg?: string) => {
     if (!document || !user || !canEdit) return;
     try {
       const liveContent =
@@ -1066,7 +1478,7 @@ export default function DocumentEditorPage() {
         author: user.name,
         authorId: user.id,
         timestamp: new Date().toISOString(),
-        message: "Updated content",
+        message: msg?.trim() || "Updated content",
         changes: [{ type: "modification", line: 0, content: "Content updated" }],
       };
       const nextDoc = {
@@ -1130,6 +1542,7 @@ export default function DocumentEditorPage() {
 
   const handleInviteCollaborator = async () => {
     if (!document || isNewDocument) return toast.error("Save document first.");
+    if (!canInvite) return toast.error("Only the document owner can invite collaborators.");
     if (!inviteEmail.trim()) return toast.error("Enter collaborator email.");
     setInviteLoading(true);
     try {
@@ -1152,6 +1565,7 @@ export default function DocumentEditorPage() {
 
   const handleCreateBranch = async () => {
     if (!document || !user || isNewDocument) return toast.error("Save document first.");
+    if (!canCreateBranch) return toast.error("You need edit access to create a branch.");
     setBranchLoading(true);
     try {
       const liveContent =
@@ -1161,7 +1575,7 @@ export default function DocumentEditorPage() {
       const liveImageUrls = uniqueUrls([...extractImageUrlsFromHtml(liveContent), ...trackedImageUrls]);
       const label = branchName.trim() || "Branch";
       const now = new Date().toISOString();
-      const payload = {
+      const payload: Omit<Document, "id"> & { collaboratorIds: string[] } = {
         ...document,
         title: `${effectiveTitle} [${label}]`,
         content: liveContent,
@@ -1170,12 +1584,17 @@ export default function DocumentEditorPage() {
         currentVersion: document.versions.length + 1,
         createdAt: now,
         updatedAt: now,
+        // Track parent for merge
+        parentDocumentId: document.id,
+        branchLabel: label,
+        branchAncestorContent: liveContent,
+        collaboratorIds: collaborators.map((c) => c.id),
       };
-      const createdId = await createDocument({ ...payload, collaboratorIds: collaborators.map((c) => c.id) });
+      const createdId = await createDocument(payload);
       setBranchOpen(false);
       setBranchName("");
       router.push(`/document/${createdId}`);
-      toast.success("Branch created.");
+      toast.success("Branch created. Edit freely — use 'Request Merge' when ready.");
     } catch (error) {
       toast.error(`Branch creation failed: ${getErrorMessage(error)}`);
     } finally {
@@ -1183,10 +1602,127 @@ export default function DocumentEditorPage() {
     }
   };
 
+  // Branch author submits a merge request — stored on the branch document itself
+  const handleRequestMerge = async () => {
+    if (!document?.parentDocumentId || !user) return;
+    if (document.mergeRequestStatus === "pending") return toast.info("A merge request is already pending review.");
+    setMergeRequestLoading(true);
+    try {
+      // Save latest content first so the reviewer sees it
+      await handleSave("Auto-saved before merge request");
+      const now = new Date().toISOString();
+      await updateDocument(document.id, {
+        mergeRequestStatus: "pending",
+        mergeRequestMessage: mergeRequestMsg.trim() || "Requesting to merge branch changes",
+        mergeRequestCreatedAt: now,
+        mergeRequestAuthorId: user.id,
+        mergeRequestAuthorName: user.name,
+      });
+      setPersistedDocument((prev) => prev ? {
+        ...prev,
+        mergeRequestStatus: "pending",
+        mergeRequestMessage: mergeRequestMsg.trim() || "Requesting to merge branch changes",
+        mergeRequestCreatedAt: now,
+        mergeRequestAuthorId: user.id,
+        mergeRequestAuthorName: user.name,
+      } : prev);
+      setMergeRequestOpen(false);
+      setMergeRequestMsg("");
+      toast.success("Merge request submitted. The document owner will review it.");
+    } catch (err) {
+      toast.error(`Failed to submit: ${getErrorMessage(err)}`);
+    } finally {
+      setMergeRequestLoading(false);
+    }
+  };
+
+  // Parent doc owner opens the merge review dialog for a branch document
+  const handleOpenMergeReview = async (branchDoc: Document) => {
+    if (!document) return;
+    try {
+      const ancestor = branchDoc.branchAncestorContent ?? branchDoc.versions[0]?.content ?? "";
+      const blocks = threeWayDiff(ancestor, document.content, branchDoc.content);
+      setMergeDiffBlocks(blocks);
+      setMergeResolutions(new Map());
+      setActiveBranchDoc(branchDoc);
+      setMergeReviewOpen(true);
+    } catch (err) {
+      toast.error(`Failed to load branch: ${getErrorMessage(err)}`);
+    }
+  };
+
+  // Parent doc owner applies the merge
+  const handleApplyMerge = async () => {
+    if (!document || !activeBranchDoc || !user) return;
+    const unresolvedConflicts = mergeDiffBlocks.filter(
+      (b) => b.status === "conflict" && !mergeResolutions.has(b.idx),
+    );
+    if (unresolvedConflicts.length > 0) {
+      return toast.error(`Resolve all ${unresolvedConflicts.length} conflict(s) before merging.`);
+    }
+    setMergeApplying(true);
+    try {
+      const mergedHtml = buildMergedHtml(mergeDiffBlocks, mergeResolutions);
+      const now = new Date().toISOString();
+      const nextVersion: Version = {
+        id: `v${document.versions.length + 1}`,
+        version: document.versions.length + 1,
+        content: mergedHtml,
+        author: user.name,
+        authorId: user.id,
+        timestamp: now,
+        message: `Merged branch: ${activeBranchDoc.branchLabel ?? activeBranchDoc.title}`,
+        changes: [],
+      };
+      // Update parent with merged content
+      await updateDocument(document.id, {
+        content: mergedHtml,
+        versions: [...document.versions, nextVersion],
+        currentVersion: nextVersion.version,
+        updatedAt: now,
+      });
+      // Mark branch document as merged
+      await updateDocument(activeBranchDoc.id, {
+        mergeRequestStatus: "merged",
+        mergeRequestResolvedAt: now,
+        mergeRequestResolvedBy: user.name,
+      });
+      editor?.commands.setContent(mergedHtml, { emitUpdate: false });
+      setPersistedDocument({ ...document, content: mergedHtml, versions: [...document.versions, nextVersion], currentVersion: nextVersion.version, updatedAt: now });
+      setBranchDocs((prev) => prev.map((b) => b.id === activeBranchDoc.id ? { ...b, mergeRequestStatus: "merged", mergeRequestResolvedAt: now, mergeRequestResolvedBy: user.name } : b));
+      setMergeReviewOpen(false);
+      setActiveBranchDoc(null);
+      toast.success("Branch merged successfully.");
+    } catch (err) {
+      toast.error(`Merge failed: ${getErrorMessage(err)}`);
+    } finally {
+      setMergeApplying(false);
+    }
+  };
+
+  // Parent doc owner rejects the merge request
+  const handleRejectMerge = async () => {
+    if (!activeBranchDoc || !user) return;
+    try {
+      const now = new Date().toISOString();
+      await updateDocument(activeBranchDoc.id, {
+        mergeRequestStatus: "rejected",
+        mergeRequestResolvedAt: now,
+        mergeRequestResolvedBy: user.name,
+      });
+      setBranchDocs((prev) => prev.map((b) => b.id === activeBranchDoc.id ? { ...b, mergeRequestStatus: "rejected", mergeRequestResolvedAt: now, mergeRequestResolvedBy: user.name } : b));
+      setMergeReviewOpen(false);
+      setActiveBranchDoc(null);
+      toast.success("Merge request rejected.");
+    } catch (err) {
+      toast.error(`Failed to reject: ${getErrorMessage(err)}`);
+    }
+  };
+
   const handlePublishCoverUpload = async (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     event.target.value = "";
-    if (!file || !user || !document) return;
+    if (!file || !user || !document || !canPublish) return;
     if (!file.type.startsWith("image/")) return toast.error("Please upload an image.");
     if (file.size > 8 * 1024 * 1024) return toast.error("Cover image must be under 8MB.");
 
@@ -1205,6 +1741,7 @@ export default function DocumentEditorPage() {
 
   const handlePublishResearch = async () => {
     if (!document || !user) return;
+    if (!canPublish) return toast.error("Only the document owner can publish this research.");
     const liveContent =
       editorModeRef.current === "quill"
         ? quillInstanceRef.current?.root.innerHTML || effectiveContent
@@ -1279,7 +1816,7 @@ export default function DocumentEditorPage() {
     }
   };
 
-  const handleExportPdf = () => {
+  const handleExportPdf = useCallback(() => {
     const liveContent =
       editorMode === "quill"
         ? quillInstanceRef.current?.root.innerHTML || effectiveContent
@@ -1316,10 +1853,19 @@ export default function DocumentEditorPage() {
       iframe.contentWindow?.print();
       setTimeout(() => iframe.remove(), 1500);
     }, 250);
-  };
+  }, [editor, editorMode, effectiveContent, effectiveTitle]);
+
+  useEffect(() => {
+    if (!document || !isDiscoverReadOnlyView || !shouldAutoDownloadPdf || pdfAutoDownloadStartedRef.current) return;
+    pdfAutoDownloadStartedRef.current = true;
+    const timer = window.setTimeout(() => {
+      handleExportPdf();
+    }, 800);
+    return () => window.clearTimeout(timer);
+  }, [document, handleExportPdf, isDiscoverReadOnlyView, shouldAutoDownloadPdf]);
 
   const handleAddComment = async () => {
-    if (!user || !document || isNewDocument || !newComment.trim()) return;
+    if (!user || !document || isNewDocument || !newComment.trim() || !canComment) return;
     setCommentSubmitting(true);
     try {
       const created = await addCommentToDocument({ documentId: document.id, author: user.name, authorId: user.id, content: newComment.trim(), selection: { start: 0, end: 0 }, timestamp: new Date().toISOString(), resolved: false, replies: [] });
@@ -1334,6 +1880,7 @@ export default function DocumentEditorPage() {
   };
 
   useEffect(() => {
+    if (!canEdit) return;
     const runTemplateShortcut = () => {
       const template = buildResearchReportTemplate();
       if (editorModeRef.current === "quill") {
@@ -1393,9 +1940,9 @@ export default function DocumentEditorPage() {
     };
     window.addEventListener("keydown", onShortcut);
     return () => window.removeEventListener("keydown", onShortcut);
-  }, [editor, editorMode, effectiveContent]);
+  }, [canEdit, editor, editorMode, effectiveContent]);
 
-  if (isLoading || !document || !user) return null;
+  if (isLoading || !document || !user || !canViewDocument) return null;
 
   return (
     <div className="min-h-screen bg-gray-50">
@@ -1410,21 +1957,57 @@ export default function DocumentEditorPage() {
           </div>
           <div className="flex items-center gap-2">
             <Badge variant="outline">v{document.currentVersion}</Badge>
+            {isDiscoverReadOnlyView && <Badge className="bg-green-100 text-green-800">Published read-only</Badge>}
             {hasChanges && <Badge className="bg-amber-100 text-amber-800">Unsaved changes</Badge>}
             {autoSaving && <Badge className="bg-blue-100 text-blue-800">Auto-saving...</Badge>}
-            <Button variant="outline" size="sm" onClick={() => imageInputRef.current?.click()} disabled={imageUploading}><ImagePlus className="mr-2 h-4 w-4" />Image</Button>
+            <Button variant="outline" size="sm" onClick={() => imageInputRef.current?.click()} disabled={!canEdit || imageUploading}><ImagePlus className="mr-2 h-4 w-4" />Image</Button>
             <input ref={imageInputRef} type="file" accept="image/*" className="hidden" onChange={handleImageUpload} />
-            <Button variant="outline" size="sm" onClick={() => setAiDialogOpen(true)}><Sparkles className="mr-2 h-4 w-4" />AI</Button>
-            <Button size="sm" onClick={handleSave} disabled={!hasChanges}><Save className="mr-2 h-4 w-4" />Save Version</Button>
+            <Button variant="outline" size="sm" onClick={handleOpenAiDialog} disabled={!canEdit}><Sparkles className="mr-2 h-4 w-4" />AI</Button>
+            <Button size="sm" onClick={() => { setCommitMessage(""); setCommitOpen(true); }} disabled={!canEdit || !hasChanges}>
+              <Save className="mr-2 h-4 w-4" />{document.parentDocumentId ? "Save to Branch" : "Save Version"}
+            </Button>
           </div>
         </div>
       </header>
+
+      {/* Branch isolation banner */}
+      {document.parentDocumentId && (
+        <div className="border-b bg-amber-50 px-4 py-2 sm:px-6 lg:px-8">
+          <div className="mx-auto flex max-w-7xl flex-wrap items-center gap-x-3 gap-y-1">
+            <GitBranch className="h-3.5 w-3.5 shrink-0 text-amber-600" />
+            <span className="text-xs font-semibold text-amber-700">Branch</span>
+            {document.branchLabel && (
+              <span className="rounded bg-amber-100 px-1.5 py-0.5 font-mono text-xs text-amber-800">{document.branchLabel}</span>
+            )}
+            <span className="text-xs text-amber-600">of</span>
+            <button
+              type="button"
+              className="text-xs font-medium text-amber-700 underline underline-offset-2 hover:text-amber-900"
+              onClick={() => document.parentDocumentId && router.push(`/document/${document.parentDocumentId}`)}
+            >
+              {parentDocTitle ?? "original document"}
+            </button>
+            <span className="ml-auto text-xs text-amber-600">Changes saved here are isolated — the original stays unchanged until the owner merges.</span>
+          </div>
+        </div>
+      )}
+
+      {isDiscoverReadOnlyView && (
+        <div className="border-b bg-green-50 px-4 py-2 sm:px-6 lg:px-8">
+          <div className="mx-auto flex max-w-7xl flex-wrap items-center gap-2 text-xs text-green-800">
+            <Globe className="h-3.5 w-3.5" />
+            <span className="font-semibold">Published view</span>
+            <span>This paper is read-only from Discover. Use Download PDF to save a copy.</span>
+          </div>
+        </div>
+      )}
+
 
       <div className="mx-auto grid max-w-7xl grid-cols-1 gap-6 px-4 py-6 sm:px-6 lg:grid-cols-[minmax(0,3fr)_minmax(320px,1fr)] lg:px-8">
         <div className="space-y-4">
           <Card>
             <CardContent className="space-y-3 pt-6">
-              {editorMode === "tiptap" && (
+              {editorMode === "tiptap" && canEdit && (
                 <Tabs defaultValue="text" className="border-b pb-3">
                   <TabsList className="w-full">
                     <TabsTrigger value="text">Text</TabsTrigger>
@@ -1513,18 +2096,58 @@ export default function DocumentEditorPage() {
                     <div className="flex flex-wrap items-center gap-2">
                       <Button size="sm" variant="outline" onMouseDown={(e) => e.preventDefault()} onClick={handleUndo}><Undo2 className="mr-2 h-4 w-4" />Undo</Button>
                       <Button size="sm" variant="outline" onMouseDown={(e) => e.preventDefault()} onClick={handleRedo}><Redo2 className="mr-2 h-4 w-4" />Redo</Button>
-                      <Button data-tour-id="document-save-version" size="sm" onClick={handleSave} disabled={!hasChanges}><Save className="mr-2 h-4 w-4" />Save Version</Button>
+                      <Button data-tour-id="document-save-version" size="sm" onClick={() => { setCommitMessage(""); setCommitOpen(true); }} disabled={!hasChanges}>
+                        <Save className="mr-2 h-4 w-4" />{document.parentDocumentId ? "Save to Branch" : "Save Version"}
+                      </Button>
                     </div>
                   </TabsContent>
                 </Tabs>
               )}
 
               {editorMode === "quill" ? (
-                <div className="report-quill-editor rounded-md border bg-white">
+                    <div className="report-quill-editor rounded-md border bg-white">
                   <div ref={quillHostRef} className="min-h-[620px]" />
                 </div>
               ) : (
-                <EditorContent editor={editor} className="min-h-[620px] rounded-md border bg-white p-4" />
+                <>
+                  {editor && (
+                    <BubbleMenu
+                      editor={editor}
+                      updateDelay={0}
+                      shouldShow={({ editor: currentEditor }) => {
+                        const { empty } = currentEditor.state.selection;
+                        return currentEditor.isEditable && !empty;
+                      }}
+                      className="flex flex-wrap items-center gap-1 rounded-xl border border-slate-200 bg-white/95 p-1.5 shadow-lg backdrop-blur"
+                    >
+                      <Button size="sm" variant={editor.isActive("bold") ? "default" : "outline"} onMouseDown={preventEditorBlur} onClick={() => editor.chain().focus().toggleBold().run()}>
+                        <Bold className="h-4 w-4" />
+                      </Button>
+                      <Button size="sm" variant={editor.isActive("italic") ? "default" : "outline"} onMouseDown={preventEditorBlur} onClick={() => editor.chain().focus().toggleItalic().run()}>
+                        <Italic className="h-4 w-4" />
+                      </Button>
+                      <Button size="sm" variant={editor.isActive("strike") ? "default" : "outline"} onMouseDown={preventEditorBlur} onClick={() => editor.chain().focus().toggleStrike().run()}>
+                        <Strikethrough className="h-4 w-4" />
+                      </Button>
+                      <Button size="sm" variant={editor.isActive("bulletList") ? "default" : "outline"} onMouseDown={preventEditorBlur} onClick={() => editor.chain().focus().toggleBulletList().run()}>
+                        <List className="h-4 w-4" />
+                      </Button>
+                      <Button size="sm" variant={editor.isActive("orderedList") ? "default" : "outline"} onMouseDown={preventEditorBlur} onClick={() => editor.chain().focus().toggleOrderedList().run()}>
+                        <ListOrdered className="h-4 w-4" />
+                      </Button>
+                      <Button size="sm" variant={editor.isActive("blockquote") ? "default" : "outline"} onMouseDown={preventEditorBlur} onClick={() => editor.chain().focus().toggleBlockquote().run()}>
+                        <Quote className="h-4 w-4" />
+                      </Button>
+                      <Button size="sm" variant="outline" onMouseDown={preventEditorBlur} onClick={handleInsertLink}>
+                        <Link2 className="h-4 w-4" />
+                      </Button>
+                      <Button size="sm" variant="outline" onMouseDown={preventEditorBlur} onClick={handleOpenAiDialog}>
+                        <Sparkles className="mr-1 h-4 w-4" />AI
+                      </Button>
+                    </BubbleMenu>
+                  )}
+                  <EditorContent editor={editor} className={`min-h-[620px] rounded-md border bg-white p-4 ${!canEdit ? "prose max-w-none cursor-default" : ""}`} />
+                </>
               )}
             </CardContent>
           </Card>
@@ -1532,15 +2155,53 @@ export default function DocumentEditorPage() {
 
         <div className="space-y-6">
           <Card>
-            <CardHeader><CardTitle className="flex items-center gap-2"><Clock className="h-4 w-4" />Version History</CardTitle></CardHeader>
-            <CardContent className="space-y-2">
-              <Select value={selectedVersion?.toString() || document.currentVersion.toString()} onValueChange={handleVersionChange}>
-                <SelectTrigger><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  {document.versions.slice().reverse().map((version) => <SelectItem key={version.id} value={version.version.toString()}>v{version.version} - {version.author}</SelectItem>)}
-                </SelectContent>
-              </Select>
-              {selectedVersion && <Button size="sm" className="w-full" onClick={handleRestoreVersion}>Restore Selected Version</Button>}
+            <CardHeader className="pb-2">
+              <CardTitle className="flex items-center gap-2 text-sm"><Clock className="h-4 w-4" />Version History
+                <span className="ml-auto rounded-full bg-gray-100 px-2 py-0.5 text-xs font-normal text-gray-500">{document.versions.length}</span>
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-1 p-3">
+              <div className="max-h-72 overflow-y-auto space-y-1 pr-1">
+                {document.versions.slice().reverse().map((v) => {
+                  const isCurrent = v.version === document.currentVersion && !selectedVersion;
+                  const isPreviewing = v.version === selectedVersion;
+                  return (
+                    <button
+                      key={v.id}
+                      type="button"
+                      onClick={() => handleVersionChange(v.version.toString())}
+                      className={`w-full rounded-lg border px-3 py-2 text-left text-xs transition-colors ${
+                        isPreviewing
+                          ? "border-blue-400 bg-blue-50 ring-1 ring-blue-300"
+                          : isCurrent
+                          ? "border-green-300 bg-green-50"
+                          : "border-transparent bg-gray-50 hover:bg-gray-100"
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-1">
+                        <span className="font-semibold text-gray-700">v{v.version}</span>
+                        {isCurrent && <span className="flex items-center gap-0.5 text-green-600 font-medium"><CheckCircle2 className="h-3 w-3" />current</span>}
+                        {isPreviewing && !isCurrent && <span className="flex items-center gap-0.5 text-blue-600 font-medium"><Eye className="h-3 w-3" />preview</span>}
+                      </div>
+                      <p className="mt-0.5 truncate text-gray-600">{v.message || "No message"}</p>
+                      <div className="mt-1 flex items-center justify-between text-gray-400">
+                        <span>{v.author}</span>
+                        <span>{new Date(v.timestamp).toLocaleDateString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}</span>
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+              {selectedVersion && selectedVersion !== document.currentVersion && (
+                <div className="flex gap-2 pt-2">
+                  <Button size="sm" variant="outline" className="flex-1 text-xs" onClick={() => { setSelectedVersion(null); editor?.commands.setContent(markdownToBasicHtml(document.content), { emitUpdate: false }); }}>
+                    Cancel
+                  </Button>
+                  <Button size="sm" className="flex-1 text-xs" onClick={handleRestoreVersion}>
+                    <RotateCcw className="mr-1 h-3 w-3" />Restore v{selectedVersion}
+                  </Button>
+                </div>
+              )}
             </CardContent>
           </Card>
 
@@ -1553,59 +2214,238 @@ export default function DocumentEditorPage() {
                   <div className="flex-1"><p className="text-sm font-medium">{collab.name}</p><p className="text-xs text-gray-500">{collab.role}</p></div>
                 </div>
               ))}
-              <Button data-tour-id="document-invite" variant="outline" size="sm" className="w-full" onClick={() => setInviteOpen(true)}><Share2 className="mr-2 h-4 w-4" />Invite</Button>
+              {canInvite && (
+                <Button data-tour-id="document-invite" variant="outline" size="sm" className="w-full" onClick={() => setInviteOpen(true)}><Share2 className="mr-2 h-4 w-4" />Invite</Button>
+              )}
             </CardContent>
           </Card>
+
+          {/* ── Merge Requests card — visible on both parent and branch docs ── */}
+          {(document.parentDocumentId || !document.parentDocumentId) && (
+            <Card>
+              <CardHeader className="pb-2">
+                <CardTitle className="flex items-center gap-2 text-sm">
+                  <GitMerge className="h-4 w-4" />
+                  {document.parentDocumentId ? "Your Merge Request" : "Merge Requests"}
+                  {(() => {
+                    if (document.parentDocumentId) return null;
+                    const pendingCount = branchDocs.filter((b) => b.mergeRequestStatus === "pending").length;
+                    return pendingCount > 0
+                      ? <span className="ml-auto flex h-5 w-5 items-center justify-center rounded-full bg-amber-500 text-[10px] font-bold text-white">{pendingCount}</span>
+                      : <span className="ml-auto rounded-full bg-gray-100 px-2 py-0.5 text-xs font-normal text-gray-500">{branchDocs.length}</span>;
+                  })()}
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-2 p-3">
+                {document.parentDocumentId ? (
+                  // Branch view — show this branch's own merge request status
+                  document.mergeRequestStatus ? (
+                    <div className={`rounded-lg border p-2.5 text-xs ${
+                      document.mergeRequestStatus === "pending" ? "border-amber-300 bg-amber-50" :
+                      document.mergeRequestStatus === "merged"  ? "border-green-200 bg-green-50" :
+                                                                   "border-gray-200 bg-gray-50"
+                    }`}>
+                      <div className="flex items-center gap-1">
+                        <span className={`inline-flex items-center gap-0.5 rounded-full px-1.5 py-0.5 text-[10px] font-semibold ${
+                          document.mergeRequestStatus === "pending" ? "bg-amber-100 text-amber-700" :
+                          document.mergeRequestStatus === "merged"  ? "bg-green-100 text-green-700" :
+                                                                       "bg-gray-100 text-gray-500"
+                        }`}>
+                          {document.mergeRequestStatus === "pending" && <AlertTriangle className="h-2.5 w-2.5" />}
+                          {document.mergeRequestStatus === "merged"  && <Check className="h-2.5 w-2.5" />}
+                          {document.mergeRequestStatus === "rejected" && <X className="h-2.5 w-2.5" />}
+                          {document.mergeRequestStatus.charAt(0).toUpperCase() + document.mergeRequestStatus.slice(1)}
+                        </span>
+                      </div>
+                      {document.mergeRequestMessage && <p className="mt-1 italic text-gray-500 line-clamp-2">&quot;{document.mergeRequestMessage}&quot;</p>}
+                      {document.mergeRequestCreatedAt && <p className="mt-1 text-gray-400">Submitted {new Date(document.mergeRequestCreatedAt).toLocaleDateString(undefined, { month: "short", day: "numeric" })}</p>}
+                      {document.mergeRequestResolvedBy && <p className="mt-0.5 text-gray-400">{document.mergeRequestStatus === "merged" ? "Merged" : "Rejected"} by {document.mergeRequestResolvedBy}</p>}
+                    </div>
+                  ) : (
+                    <div className="flex flex-col items-center gap-1.5 rounded-lg border border-dashed border-gray-200 py-5 text-center">
+                      <GitBranch className="h-6 w-6 text-gray-300" />
+                      <p className="text-xs text-gray-400">No merge request yet.{"\n"}Use &quot;Request Merge&quot; in Actions.</p>
+                    </div>
+                  )
+                ) : (
+                  // Parent view — show all branch documents
+                  branchDocs.length === 0 ? (
+                    <div className="flex flex-col items-center gap-1.5 rounded-lg border border-dashed border-gray-200 py-5 text-center">
+                      <GitBranch className="h-6 w-6 text-gray-300" />
+                      <p className="text-xs text-gray-400">No branches yet.{"\n"}Create a branch to start collaborating.</p>
+                    </div>
+                  ) : (
+                    <div className="space-y-2">
+                      {branchDocs.map((b) => {
+                        const status = b.mergeRequestStatus;
+                        const isPending = status === "pending";
+                        const isMerged  = status === "merged";
+                        return (
+                          <div key={b.id} className={`rounded-lg border p-2.5 text-xs ${
+                            isPending ? "border-amber-300 bg-amber-50" :
+                            isMerged  ? "border-green-200 bg-green-50" :
+                                        "border-gray-200 bg-gray-50"
+                          }`}>
+                            <div className="flex items-start justify-between gap-1">
+                              {status ? (
+                                <span className={`inline-flex items-center gap-0.5 rounded-full px-1.5 py-0.5 text-[10px] font-semibold ${
+                                  isPending ? "bg-amber-100 text-amber-700" :
+                                  isMerged  ? "bg-green-100 text-green-700" :
+                                              "bg-gray-100 text-gray-500"
+                                }`}>
+                                  {isPending && <AlertTriangle className="h-2.5 w-2.5" />}
+                                  {isMerged  && <Check className="h-2.5 w-2.5" />}
+                                  {status === "rejected" && <X className="h-2.5 w-2.5" />}
+                                  {status.charAt(0).toUpperCase() + status.slice(1)}
+                                </span>
+                              ) : (
+                                <span className="inline-flex items-center gap-0.5 rounded-full bg-gray-100 px-1.5 py-0.5 text-[10px] font-semibold text-gray-500">
+                                  <GitBranch className="h-2.5 w-2.5" />Branch
+                                </span>
+                              )}
+                              {isPending && (
+                                <button
+                                  type="button"
+                                  onClick={() => handleOpenMergeReview(b)}
+                                  className="rounded bg-amber-500 px-2 py-0.5 text-[10px] font-semibold text-white hover:bg-amber-600 transition-colors"
+                                >
+                                  Review
+                                </button>
+                              )}
+                            </div>
+                            <p className="mt-1.5 font-medium text-gray-700 truncate">{b.branchLabel ?? b.title}</p>
+                            {b.mergeRequestMessage && <p className="mt-0.5 italic text-gray-500 line-clamp-2">&quot;{b.mergeRequestMessage}&quot;</p>}
+                            <div className="mt-1.5 flex items-center justify-between text-gray-400">
+                              <span>{b.mergeRequestAuthorName ?? b.ownerName}</span>
+                              {b.mergeRequestCreatedAt && <span>{new Date(b.mergeRequestCreatedAt).toLocaleDateString(undefined, { month: "short", day: "numeric" })}</span>}
+                            </div>
+                            {b.mergeRequestResolvedBy && <p className="mt-0.5 text-gray-400">{isMerged ? "Merged" : "Rejected"} by {b.mergeRequestResolvedBy}</p>}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )
+                )}
+              </CardContent>
+            </Card>
+          )}
 
           <Card>
             <CardHeader><CardTitle>Actions</CardTitle></CardHeader>
             <CardContent className="space-y-2">
-              <Button data-tour-id="document-publish" variant="default" size="sm" className="w-full justify-start" onClick={() => setPublishOpen(true)}>
-                {publishVisibility === "public" ? <Globe className="mr-2 h-4 w-4 shrink-0" /> : <Lock className="mr-2 h-4 w-4 shrink-0" />}
-                Publish Research
-              </Button>
-              <Button variant="outline" size="sm" className="h-auto w-full justify-start py-2 text-left leading-tight" onClick={handleInsertReportTemplate}>
-                <Heading1 className="mr-2 h-4 w-4 shrink-0" />
-                <span>Report Template <span className="block text-xs text-gray-500">Ctrl+Alt+R</span></span>
-              </Button>
-              <Button variant="outline" size="sm" className="h-auto w-full justify-start py-2 text-left leading-tight" onClick={handleCreateTableOfContents}>
-                <ListOrdered className="mr-2 h-4 w-4 shrink-0" />
-                <span>Create Table of Contents <span className="block text-xs text-gray-500">Ctrl+Alt+T</span></span>
-              </Button>
-              <Button variant="outline" size="sm" className="h-auto w-full justify-start py-2 text-left leading-tight" onClick={handleCreateImageIndex}>
-                <ImagePlus className="mr-2 h-4 w-4 shrink-0" />
-                <span>Create Image Index <span className="block text-xs text-gray-500">Ctrl+Alt+I</span></span>
-              </Button>
-              <Button variant="outline" size="sm" className="w-full justify-start" onClick={() => setBranchOpen(true)}><GitBranch className="mr-2 h-4 w-4 shrink-0" />Create Branch</Button>
-              <Button data-tour-id="document-export" variant="outline" size="sm" className="w-full justify-start" onClick={handleExportPdf}><Download className="mr-2 h-4 w-4 shrink-0" />Export PDF</Button>
-              <Button data-tour-id="document-comments" variant="outline" size="sm" className="w-full justify-start" onClick={() => setCommentsOpen(true)}><MessageSquare className="mr-2 h-4 w-4 shrink-0" />Comments ({comments.length})</Button>
+              {canPublish && (
+                <Button data-tour-id="document-publish" variant="default" size="sm" className="w-full justify-start" onClick={() => setPublishOpen(true)}>
+                  {publishVisibility === "public" ? <Globe className="mr-2 h-4 w-4 shrink-0" /> : <Lock className="mr-2 h-4 w-4 shrink-0" />}
+                  Publish Research
+                </Button>
+              )}
+              {canEdit && (
+                <>
+                  <Button variant="outline" size="sm" className="h-auto w-full justify-start py-2 text-left leading-tight" onClick={handleInsertReportTemplate}>
+                    <Heading1 className="mr-2 h-4 w-4 shrink-0" />
+                    <span>Report Template <span className="block text-xs text-gray-500">Ctrl+Alt+R</span></span>
+                  </Button>
+                  <Button variant="outline" size="sm" className="h-auto w-full justify-start py-2 text-left leading-tight" onClick={handleCreateTableOfContents}>
+                    <ListOrdered className="mr-2 h-4 w-4 shrink-0" />
+                    <span>Create Table of Contents <span className="block text-xs text-gray-500">Ctrl+Alt+T</span></span>
+                  </Button>
+                  <Button variant="outline" size="sm" className="h-auto w-full justify-start py-2 text-left leading-tight" onClick={handleCreateImageIndex}>
+                    <ImagePlus className="mr-2 h-4 w-4 shrink-0" />
+                    <span>Create Image Index <span className="block text-xs text-gray-500">Ctrl+Alt+I</span></span>
+                  </Button>
+                </>
+              )}
+              {/* Branch: only on non-branch documents */}
+              {canCreateBranch && (
+                <Button variant="outline" size="sm" className="w-full justify-start" onClick={() => setBranchOpen(true)}>
+                  <GitBranch className="mr-2 h-4 w-4 shrink-0" />Create Branch
+                </Button>
+              )}
+              {/* Request Merge: shown on branch documents */}
+              {document.parentDocumentId && canEdit && (
+                <Button
+                  size="sm"
+                  variant={document.mergeRequestStatus === "pending" ? "outline" : "default"}
+                  className="w-full justify-start"
+                  disabled={document.mergeRequestStatus === "pending" || document.mergeRequestStatus === "merged"}
+                  onClick={() => { setMergeRequestMsg(""); setMergeRequestOpen(true); }}
+                >
+                  <GitMerge className="mr-2 h-4 w-4 shrink-0" />
+                  {document.mergeRequestStatus === "pending" ? "Merge Requested ✓" :
+                   document.mergeRequestStatus === "merged"  ? "Already Merged" :
+                                                               "Request Merge"}
+                </Button>
+              )}
+              <Button data-tour-id="document-export" variant={isDiscoverReadOnlyView ? "default" : "outline"} size="sm" className="w-full justify-start" onClick={handleExportPdf}><Download className="mr-2 h-4 w-4 shrink-0" />Download PDF</Button>
+              {canComment && (
+                <Button data-tour-id="document-comments" variant="outline" size="sm" className="w-full justify-start" onClick={() => setCommentsOpen(true)}><MessageSquare className="mr-2 h-4 w-4 shrink-0" />Comments ({comments.length})</Button>
+              )}
             </CardContent>
           </Card>
 
           <Card>
-            <CardHeader><CardTitle className="flex items-center gap-2"><ImagePlus className="h-4 w-4" />Image Library</CardTitle></CardHeader>
-            <CardContent className="space-y-3">
-              {allImageUrls.length === 0 ? <p className="text-sm text-gray-500">No images yet.</p> : allImageUrls.map((url, i) => (
-                <div key={`${url}-${i}`} className="space-y-2 rounded-md border p-2">
-                  <div className="relative h-24 w-full overflow-hidden rounded">
-                    <NextImage
-                      src={url}
-                      alt={`img-${i + 1}`}
-                      fill
-                      unoptimized
-                      sizes="(max-width: 1024px) 100vw, 320px"
-                      className="object-cover"
-                    />
-                  </div>
-                  <div className="flex flex-col gap-2 sm:flex-row">
-                    <Button size="sm" variant="outline" className="w-full" onClick={() => handleInsertExistingImage(url)}>Insert</Button>
-                    <Button size="sm" variant="outline" className="w-full text-red-600" onClick={() => void handleRemoveImage(url)}>
-                      <Trash2 className="mr-1 h-4 w-4" />
-                      Remove
-                    </Button>
-                  </div>
+            <CardHeader className="pb-2">
+              <CardTitle className="flex items-center gap-2 text-sm">
+                <ImagePlus className="h-4 w-4" />Image Library
+                {allImageUrls.length > 0 && (
+                  <span className="ml-auto rounded-full bg-gray-100 px-2 py-0.5 text-xs font-normal text-gray-500">{allImageUrls.length}</span>
+                )}
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-2 p-3">
+              {allImageUrls.length === 0 ? (
+                <div className="flex flex-col items-center gap-2 rounded-lg border border-dashed border-gray-200 py-6 text-center">
+                  <ImagePlus className="h-7 w-7 text-gray-300" />
+                  <p className="text-xs text-gray-400">No images yet.<br />Upload one using the toolbar.</p>
                 </div>
-              ))}
+              ) : (
+                allImageUrls.map((url, i) => (
+                  <div key={`${url}-${i}`} className="overflow-hidden rounded-lg border border-gray-200 bg-white shadow-sm">
+                    <div className="relative h-28 w-full bg-gray-50">
+                      <NextImage
+                        src={url}
+                        alt={`img-${i + 1}`}
+                        fill
+                        unoptimized
+                        sizes="320px"
+                        className="object-cover transition-opacity duration-200"
+                      />
+                      <span className="absolute left-1.5 top-1.5 rounded bg-black/40 px-1.5 py-0.5 text-[10px] font-medium text-white">
+                        #{i + 1}
+                      </span>
+                    </div>
+                    <div className="grid grid-cols-2 divide-x border-t">
+                      {canEdit ? (
+                        <>
+                          <button
+                            type="button"
+                            onClick={() => handleInsertExistingImage(url)}
+                            className="flex items-center justify-center gap-1 py-1.5 text-xs font-medium text-gray-700 hover:bg-gray-50 transition-colors"
+                          >
+                            <ImagePlus className="h-3 w-3" />Insert
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => void handleRemoveImage(url)}
+                            className="flex items-center justify-center gap-1 py-1.5 text-xs font-medium text-red-500 hover:bg-red-50 transition-colors"
+                          >
+                            <Trash2 className="h-3 w-3" />Remove
+                          </button>
+                        </>
+                      ) : (
+                        <a
+                          href={url}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="col-span-2 flex items-center justify-center gap-1 py-1.5 text-xs font-medium text-gray-700 hover:bg-gray-50 transition-colors"
+                        >
+                          Open image
+                        </a>
+                      )}
+                    </div>
+                  </div>
+                ))
+              )}
             </CardContent>
           </Card>
         </div>
@@ -1633,11 +2473,186 @@ export default function DocumentEditorPage() {
 
       <Dialog open={branchOpen} onOpenChange={setBranchOpen}>
         <DialogContent>
-          <DialogHeader><DialogTitle>Create Branch</DialogTitle><DialogDescription>Create a paper copy from current state.</DialogDescription></DialogHeader>
-          <div className="space-y-2"><Label htmlFor="branch-name">Branch name</Label><Input id="branch-name" value={branchName} onChange={(e) => setBranchName(e.target.value)} /></div>
+          <DialogHeader><DialogTitle>Create Branch</DialogTitle><DialogDescription>Create an independent copy of this document to work on separately. When ready, request a merge back.</DialogDescription></DialogHeader>
+          <div className="space-y-2"><Label htmlFor="branch-name">Branch name</Label><Input id="branch-name" value={branchName} onChange={(e) => setBranchName(e.target.value)} placeholder="e.g. methodology-revision" /></div>
           <DialogFooter>
             <Button variant="outline" onClick={() => setBranchOpen(false)}>Cancel</Button>
-            <Button onClick={handleCreateBranch} disabled={branchLoading}>{branchLoading ? "Creating..." : "Create"}</Button>
+            <Button onClick={handleCreateBranch} disabled={branchLoading}>{branchLoading ? "Creating..." : "Create Branch"}</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Branch author: submit merge request */}
+      <Dialog open={mergeRequestOpen} onOpenChange={setMergeRequestOpen}>
+        <DialogContent className="w-full max-w-sm sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2"><GitMerge className="h-4 w-4" />Request Merge</DialogTitle>
+            <DialogDescription>Ask the original document owner to review and merge your branch changes.</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-2">
+            <Label htmlFor="merge-msg">Description (optional)</Label>
+            <Textarea
+              id="merge-msg"
+              value={mergeRequestMsg}
+              onChange={(e) => setMergeRequestMsg(e.target.value)}
+              placeholder="Describe what you changed and why it should be merged…"
+              className="min-h-20"
+              disabled={mergeRequestLoading}
+            />
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setMergeRequestOpen(false)} disabled={mergeRequestLoading}>Cancel</Button>
+            <Button onClick={handleRequestMerge} disabled={mergeRequestLoading}>
+              {mergeRequestLoading ? "Submitting…" : "Submit Request"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Parent doc owner: review merge request with diff */}
+      <Dialog open={mergeReviewOpen} onOpenChange={(open) => { if (!mergeApplying) setMergeReviewOpen(open); }}>
+        <DialogContent className="w-full max-w-2xl">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2"><GitMerge className="h-4 w-4" />Review Merge Request</DialogTitle>
+            {activeBranchDoc && (
+              <DialogDescription>
+                <strong>{activeBranchDoc.mergeRequestAuthorName ?? activeBranchDoc.ownerName}</strong> wants to merge <em>{activeBranchDoc.branchLabel ?? activeBranchDoc.title}</em> into this document.
+                {activeBranchDoc.mergeRequestMessage && <><br /><span className="italic">&quot;{activeBranchDoc.mergeRequestMessage}&quot;</span></>}
+              </DialogDescription>
+            )}
+          </DialogHeader>
+
+          {/* Legend */}
+          <div className="flex flex-wrap gap-3 text-xs">
+            <span className="flex items-center gap-1"><span className="inline-block h-3 w-3 rounded bg-green-200" />Branch addition</span>
+            <span className="flex items-center gap-1"><span className="inline-block h-3 w-3 rounded bg-orange-100 border border-orange-300" />Parent-only (preserved)</span>
+            <span className="flex items-center gap-1"><span className="inline-block h-3 w-3 rounded bg-yellow-200 border border-yellow-400" />Conflict — choose a version</span>
+            <span className="flex items-center gap-1"><span className="inline-block h-3 w-3 rounded bg-gray-100" />Unchanged</span>
+          </div>
+
+          {/* Diff viewer */}
+          <div className="max-h-96 overflow-y-auto rounded-lg border text-sm font-mono">
+            {mergeDiffBlocks.length === 0 && (
+              <p className="p-4 text-gray-500 text-center">No differences detected.</p>
+            )}
+            {mergeDiffBlocks.map((block) => {
+              if (block.status === "unchanged") {
+                return (
+                  <div key={block.idx} className="border-b border-gray-100 bg-white px-3 py-1.5 text-gray-400 text-xs last:border-0">
+                    {block.text}
+                  </div>
+                );
+              }
+              if (block.status === "branch-add") {
+                return (
+                  <div key={block.idx} className="border-b border-green-100 bg-green-50 px-3 py-1.5 last:border-0 flex gap-2">
+                    <span className="shrink-0 font-bold text-green-600">+</span>
+                    <span className="text-green-800">{block.text}</span>
+                  </div>
+                );
+              }
+              if (block.status === "parent-only") {
+                return (
+                  <div key={block.idx} className="border-b border-orange-100 bg-orange-50 px-3 py-1.5 last:border-0 flex gap-2">
+                    <span className="shrink-0 font-bold text-orange-400">~</span>
+                    <span className="text-orange-700">{block.text}</span>
+                  </div>
+                );
+              }
+              // conflict
+              const resolution = mergeResolutions.get(block.idx);
+              return (
+                <div key={block.idx} className="border-b border-yellow-300 bg-yellow-50 px-3 py-2 last:border-0 space-y-1">
+                  <div className="flex items-center gap-1 text-xs font-semibold text-yellow-700">
+                    <AlertTriangle className="h-3 w-3" />CONFLICT — pick a version:
+                  </div>
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setMergeResolutions((prev) => new Map(prev).set(block.idx, "parent"))}
+                      className={`rounded border p-2 text-left text-xs transition-colors ${resolution === "parent" ? "border-blue-400 bg-blue-100 ring-1 ring-blue-400" : "border-gray-200 bg-white hover:bg-gray-50"}`}
+                    >
+                      <div className="mb-1 flex items-center gap-1 font-semibold text-blue-700">
+                        {resolution === "parent" && <Check className="h-3 w-3" />}Keep Parent
+                      </div>
+                      <span className="text-gray-600">{block.text}</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setMergeResolutions((prev) => new Map(prev).set(block.idx, "branch"))}
+                      className={`rounded border p-2 text-left text-xs transition-colors ${resolution === "branch" ? "border-green-400 bg-green-100 ring-1 ring-green-400" : "border-gray-200 bg-white hover:bg-gray-50"}`}
+                    >
+                      <div className="mb-1 flex items-center gap-1 font-semibold text-green-700">
+                        {resolution === "branch" && <Check className="h-3 w-3" />}Use Branch
+                      </div>
+                      <span className="text-gray-600">{block.branchText}</span>
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          {/* Conflict summary */}
+          {(() => {
+            const total = mergeDiffBlocks.filter((b) => b.status === "conflict").length;
+            const resolved = mergeDiffBlocks.filter((b) => b.status === "conflict" && mergeResolutions.has(b.idx)).length;
+            return total > 0 ? (
+              <p className={`text-xs font-medium ${resolved < total ? "text-yellow-600" : "text-green-600"}`}>
+                {resolved < total ? <><AlertTriangle className="inline h-3 w-3 mr-1" />{total - resolved} conflict(s) still need resolution</> : <><Check className="inline h-3 w-3 mr-1" />All conflicts resolved — ready to merge</>}
+              </p>
+            ) : null;
+          })()}
+
+          <DialogFooter className="gap-2">
+            <Button variant="outline" className="text-red-600 hover:bg-red-50" onClick={handleRejectMerge} disabled={mergeApplying}>
+              <X className="mr-1.5 h-4 w-4" />Reject
+            </Button>
+            <Button variant="outline" onClick={() => setMergeReviewOpen(false)} disabled={mergeApplying}>Close</Button>
+            <Button
+              onClick={handleApplyMerge}
+              disabled={mergeApplying || mergeDiffBlocks.filter((b) => b.status === "conflict" && !mergeResolutions.has(b.idx)).length > 0}
+            >
+              <GitMerge className="mr-1.5 h-4 w-4" />
+              {mergeApplying ? "Merging…" : "Merge"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Commit / Save Version dialog */}
+      <Dialog open={commitOpen} onOpenChange={setCommitOpen}>
+        <DialogContent className="w-full max-w-sm sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              {document.parentDocumentId ? <GitBranch className="h-4 w-4" /> : <GitCommit className="h-4 w-4" />}
+              {document.parentDocumentId ? "Save Branch Changes" : "Save Version"}
+            </DialogTitle>
+            <DialogDescription>
+              {document.parentDocumentId
+                ? "Changes are saved to this branch only. The original document stays unchanged until the owner merges your request."
+                : "Describe what changed in this version. This becomes part of your version history."}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-2">
+            <Label htmlFor="commit-msg">Commit message</Label>
+            <input
+              id="commit-msg"
+              type="text"
+              value={commitMessage}
+              onChange={(e) => setCommitMessage(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter") { void handleSave(commitMessage); setCommitOpen(false); } }}
+              placeholder="e.g. Added methodology section"
+              className="w-full rounded-md border border-gray-300 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-blue-500"
+              autoFocus
+            />
+            <p className="text-xs text-gray-400">Press Enter or click Save to commit · leave blank for a generic message</p>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setCommitOpen(false)}>Cancel</Button>
+            <Button onClick={() => { void handleSave(commitMessage); setCommitOpen(false); }}>
+              <Save className="mr-2 h-4 w-4" />Save
+            </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
@@ -1680,11 +2695,21 @@ export default function DocumentEditorPage() {
         </DialogContent>
       </Dialog>
 
-      <Dialog open={aiDialogOpen} onOpenChange={setAiDialogOpen}>
+      <Dialog
+        open={aiDialogOpen}
+        onOpenChange={(open) => {
+          if (aiLoading) return;
+          setAiDialogOpen(open);
+          if (!open) {
+            setAiPreview(null);
+            setAiSelection(null);
+          }
+        }}
+      >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Prompt Assistant</DialogTitle>
-            <DialogDescription>Select text, then enter a prompt (for example: summarize, expand, title case, uppercase).</DialogDescription>
+            <DialogTitle>AI Prompt Assistant</DialogTitle>
+            <DialogDescription>Select text in the document, then describe what you want done — e.g. &quot;summarize in 3 bullet points&quot;, &quot;rewrite more formally&quot;, &quot;expand with more detail&quot;.</DialogDescription>
           </DialogHeader>
           <div className="space-y-2">
             <Label htmlFor="ai-prompt">Prompt</Label>
@@ -1692,29 +2717,90 @@ export default function DocumentEditorPage() {
               id="ai-prompt"
               value={aiPrompt}
               onChange={(e) => setAiPrompt(e.target.value)}
-              placeholder="Example: summarize this paragraph in 2 sentences"
+              onKeyDown={(e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey) && !aiLoading) handleRunPrompt(); }}
+              placeholder="Example: summarize this in 2 sentences, rewrite more formally, convert to bullet points"
               className="min-h-24"
+              disabled={aiLoading}
             />
           </div>
+          {aiPreview && (
+            <div className="space-y-3">
+              <div className="flex flex-wrap gap-3 text-xs">
+                <span className="flex items-center gap-1"><span className="inline-block h-3 w-3 rounded bg-green-200" />Added</span>
+                <span className="flex items-center gap-1"><span className="inline-block h-3 w-3 rounded bg-red-200" />Removed</span>
+                <span className="flex items-center gap-1"><span className="inline-block h-3 w-3 rounded bg-yellow-200" />Changed</span>
+              </div>
+              <div className="max-h-72 overflow-y-auto rounded-lg border bg-slate-50 p-3 text-sm leading-7">
+                <div className="whitespace-pre-wrap break-words">
+                  {aiPreview.segments.map((segment, index) => {
+                    if (segment.type === "unchanged") {
+                      return <span key={index} className="text-slate-700">{segment.value}</span>;
+                    }
+                    if (segment.type === "add") {
+                      return <span key={index} className="rounded bg-green-100 px-0.5 text-green-900">{segment.value}</span>;
+                    }
+                    if (segment.type === "remove") {
+                      return <span key={index} className="rounded bg-red-100 px-0.5 text-red-800 line-through">{segment.value}</span>;
+                    }
+                    return (
+                      <span key={index} className="inline-flex flex-wrap items-center gap-1 rounded bg-yellow-100 px-1 py-0.5 text-yellow-900">
+                        <span className="line-through text-red-700">{segment.value}</span>
+                        <span className="font-medium">{segment.nextValue}</span>
+                      </span>
+                    );
+                  })}
+                </div>
+              </div>
+              <p className="text-xs text-slate-500">
+                Nothing is inserted into the document until you confirm the edits.
+              </p>
+            </div>
+          )}
+          <Button onClick={handleConfirmAiEdits} disabled={aiLoading || !aiPreview}>Confirm Edits</Button>
           <DialogFooter>
-            <Button variant="outline" onClick={() => setAiDialogOpen(false)}>Cancel</Button>
-            <Button onClick={handleRunPrompt}>Apply Prompt</Button>
+            <Button
+              variant="outline"
+              onClick={() => {
+                setAiDialogOpen(false);
+                setAiPreview(null);
+                setAiSelection(null);
+              }}
+              disabled={aiLoading}
+            >
+              Cancel
+            </Button>
+            <Button onClick={handleRunPrompt} disabled={aiLoading}>
+              {aiLoading ? "Thinking…" : "Apply Prompt"}
+            </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
 
       <Dialog open={imageEditorOpen} onOpenChange={setImageEditorOpen}>
-        <DialogContent className="sm:max-w-lg">
+        <DialogContent className="w-full max-w-sm sm:max-w-md">
           <DialogHeader>
-            <DialogTitle>Image Editor</DialogTitle>
-            <DialogDescription>Resize, align, and reposition the selected image. You can also drag the image directly inside the document.</DialogDescription>
+            <DialogTitle className="flex items-center gap-2"><ImagePlus className="h-4 w-4" />Image Editor</DialogTitle>
+            <DialogDescription>Resize and align the selected image.</DialogDescription>
           </DialogHeader>
-          <div className="space-y-4">
-            <p className="truncate text-xs text-gray-500">{selectedImageSrc || "No image selected"}</p>
-            <div className="space-y-1">
-              <div className="flex items-center justify-between text-xs text-gray-600">
-                <span>Size</span>
-                <span>{selectedImageWidth}%</span>
+
+          {/* Preview */}
+          {selectedImageSrc && (
+            <div className="flex justify-center rounded-lg border bg-gray-50 p-2">
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img
+                src={selectedImageSrc}
+                alt="preview"
+                className="max-h-36 max-w-full rounded object-contain"
+              />
+            </div>
+          )}
+
+          <div className="space-y-5">
+            {/* Size slider */}
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="text-sm font-medium">Width</span>
+                <span className="rounded-md bg-gray-100 px-2 py-0.5 text-sm font-mono">{selectedImageWidth}%</span>
               </div>
               <input
                 type="range"
@@ -1727,31 +2813,54 @@ export default function DocumentEditorPage() {
                   setSelectedImageWidth(width);
                   handleApplySelectedImageStyle(width, selectedImageAlign);
                 }}
-                className="w-full"
+                className="h-2 w-full cursor-pointer accent-blue-600"
               />
-            </div>
-            <div className="grid grid-cols-3 gap-2">
-              <Button size="sm" variant={selectedImageAlign === "left" ? "default" : "outline"} onClick={() => { setSelectedImageAlign("left"); handleApplySelectedImageStyle(selectedImageWidth, "left"); }}>Left</Button>
-              <Button size="sm" variant={selectedImageAlign === "center" ? "default" : "outline"} onClick={() => { setSelectedImageAlign("center"); handleApplySelectedImageStyle(selectedImageWidth, "center"); }}>Center</Button>
-              <Button size="sm" variant={selectedImageAlign === "right" ? "default" : "outline"} onClick={() => { setSelectedImageAlign("right"); handleApplySelectedImageStyle(selectedImageWidth, "right"); }}>Right</Button>
-            </div>
-            <div className="grid grid-cols-2 gap-2">
-              <Button size="sm" variant="outline" onClick={() => handleMoveSelectedImage("up")}>Move Up</Button>
-              <Button size="sm" variant="outline" onClick={() => handleMoveSelectedImage("down")}>Move Down</Button>
-            </div>
-            <div className="space-y-2 rounded-md border p-2">
-              <p className="text-xs text-gray-500">Fine Position (px)</p>
-              <div className="grid grid-cols-2 gap-2">
-                <Button size="sm" variant="outline" onClick={() => handleNudgeSelectedImage("x", -10)}>Left -10</Button>
-                <Button size="sm" variant="outline" onClick={() => handleNudgeSelectedImage("x", 10)}>Right +10</Button>
-                <Button size="sm" variant="outline" onClick={() => handleNudgeSelectedImage("y", -10)}>Up -10</Button>
-                <Button size="sm" variant="outline" onClick={() => handleNudgeSelectedImage("y", 10)}>Down +10</Button>
+              <div className="flex justify-between text-xs text-gray-400">
+                <span>20%</span><span>60%</span><span>100%</span>
               </div>
-              <p className="text-xs text-gray-500">Current offset: X {selectedImageLeft}px, Y {selectedImageTop}px</p>
+            </div>
+
+            {/* Alignment */}
+            <div className="space-y-2">
+              <span className="text-sm font-medium">Alignment</span>
+              <div className="grid grid-cols-3 gap-2">
+                {(["left", "center", "right"] as const).map((align) => {
+                  const Icon = align === "left" ? AlignLeft : align === "center" ? AlignCenter : AlignRight;
+                  return (
+                    <Button
+                      key={align}
+                      size="sm"
+                      variant={selectedImageAlign === align ? "default" : "outline"}
+                      className="flex items-center gap-1.5 capitalize"
+                      onClick={() => { setSelectedImageAlign(align); handleApplySelectedImageStyle(selectedImageWidth, align); }}
+                    >
+                      <Icon className="h-3.5 w-3.5" />{align}
+                    </Button>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* Fine position nudge */}
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="text-sm font-medium">Fine Position</span>
+                <span className="text-xs text-gray-400">X {selectedImageLeft}px · Y {selectedImageTop}px</span>
+              </div>
+              <div className="flex flex-col items-center gap-1">
+                <Button size="sm" variant="outline" className="w-10 h-8 p-0" onClick={() => handleNudgeSelectedImage("y", -10)}><ArrowUp className="h-3.5 w-3.5" /></Button>
+                <div className="flex gap-1">
+                  <Button size="sm" variant="outline" className="w-10 h-8 p-0" onClick={() => handleNudgeSelectedImage("x", -10)}><ChevronLeft className="h-3.5 w-3.5" /></Button>
+                  <Button size="sm" variant="outline" className="w-10 h-8 p-0 text-gray-300 cursor-default" disabled><Minus className="h-3 w-3" /></Button>
+                  <Button size="sm" variant="outline" className="w-10 h-8 p-0" onClick={() => handleNudgeSelectedImage("x", 10)}><ChevronRight className="h-3.5 w-3.5" /></Button>
+                </div>
+                <Button size="sm" variant="outline" className="w-10 h-8 p-0" onClick={() => handleNudgeSelectedImage("y", 10)}><ArrowDown className="h-3.5 w-3.5" /></Button>
+              </div>
             </div>
           </div>
+
           <DialogFooter>
-            <Button variant="outline" onClick={() => setImageEditorOpen(false)}>Close</Button>
+            <Button className="w-full sm:w-auto" onClick={() => setImageEditorOpen(false)}>Done</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

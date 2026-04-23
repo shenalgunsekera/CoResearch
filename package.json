@@ -9,9 +9,12 @@
     "start": "next start",
     "lint": "eslint .",
     "type-check": "tsc --noEmit",
+    "test:selenium": "node --test tests/selenium/app.test.mjs",
+    "test:selenium:local": "node tests/selenium/run-local.mjs",
     "seed:firestore": "node scripts/seed-firestore.mjs"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.80.0",
     "@tiptap/extension-color": "^3.20.0",
     "@tiptap/extension-image": "^3.20.0",
     "@tiptap/extension-link": "^3.20.0",
@@ -23,6 +26,7 @@
     "clsx": "^2.0.0",
     "firebase": "^12.10.0",
     "firebase-admin": "^13.7.0",
+    "groq-sdk": "^1.1.2",
     "lucide-react": "^0.487.0",
     "next": "16.1.5",
     "next-themes": "^0.2.1",
@@ -48,6 +52,7 @@
     "@types/react-dom": "^18",
     "eslint": "^9",
     "eslint-config-next": "16.1.5",
+    "selenium-webdriver": "^4.43.0",
     "tailwindcss": "^4",
     "typescript": "^5"
   },

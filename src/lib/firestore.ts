@@ -7,6 +7,7 @@ import {
   doc,
   getDoc,
   getDocs,
+  onSnapshot,
   query,
   setDoc,
   updateDoc,
@@ -104,6 +105,21 @@ export async function getDocumentById(id: string): Promise<Document | null> {
   const snap = await getDoc(ref);
   if (!snap.exists()) return null;
   return { ...(snap.data() as Omit<Document, "id">), id: snap.id };
+}
+
+export function subscribeToDocumentById(
+  id: string,
+  onDocument: (document: Document | null) => void,
+  onError?: (error: Error) => void,
+) {
+  const ref = doc(getDbOrThrow(), DOCUMENTS, id);
+  return onSnapshot(
+    ref,
+    (snap) => {
+      onDocument(snap.exists() ? { ...(snap.data() as Omit<Document, "id">), id: snap.id } : null);
+    },
+    (error) => onError?.(error),
+  );
 }
 
 export async function createDocument(
@@ -229,4 +245,15 @@ export function buildUserFromProfile(input: {
     interests: input.interests,
     verified: input.verified ?? false,
   };
+}
+
+// Merge requests are stored directly on the branch Document — no separate collection needed.
+// This means we only need the already-deployed /documents rules.
+
+export async function getBranchDocumentsForParent(parentDocumentId: string): Promise<Document[]> {
+  const q = query(collection(getDbOrThrow(), DOCUMENTS), where("parentDocumentId", "==", parentDocumentId));
+  const snap = await getDocs(q);
+  return snap.docs
+    .map((d) => ({ ...(d.data() as Omit<Document, "id">), id: d.id }))
+    .sort((a, b) => (b.mergeRequestCreatedAt ?? b.updatedAt).localeCompare(a.mergeRequestCreatedAt ?? a.updatedAt));
 }

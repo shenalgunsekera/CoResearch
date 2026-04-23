@@ -41,6 +41,32 @@ export interface Document {
   createdAt: string;
   updatedAt: string;
   university: string;
+  // Branch tracking
+  parentDocumentId?: string;
+  branchLabel?: string;
+  branchAncestorContent?: string;
+  // Merge request — stored on the branch document itself (no separate collection needed)
+  mergeRequestStatus?: "pending" | "merged" | "rejected";
+  mergeRequestMessage?: string;
+  mergeRequestCreatedAt?: string;
+  mergeRequestAuthorId?: string;
+  mergeRequestAuthorName?: string;
+  mergeRequestResolvedAt?: string;
+  mergeRequestResolvedBy?: string;
+}
+
+export interface MergeRequest {
+  id: string;
+  branchDocumentId: string;
+  branchTitle: string;
+  parentDocumentId: string;
+  authorId: string;
+  authorName: string;
+  message: string;
+  status: "pending" | "merged" | "rejected";
+  createdAt: string;
+  resolvedAt?: string;
+  resolvedBy?: string;
 }
 
 export interface Collaborator {

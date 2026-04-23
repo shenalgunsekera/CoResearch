@@ -315,9 +315,9 @@ export default function DiscoverPage() {
                             <div className="flex flex-col gap-2 ml-4">
                               <Button
                                 size="sm"
-                                onClick={() => router.push(`/document/${doc.id}`)}
+                                onClick={() => router.push(`/document/${doc.id}?view=published&download=1`)}
                               >
-                                View Paper
+                                View / Download PDF
                               </Button>
                               <Button
                                 size="sm"
