@@ -90,6 +90,12 @@ service cloud.firestore {
         request.auth.uid == resource.data.ownerId;
     }
 
+    match /documents/{documentId}/documentPresence/{userId} {
+      allow read: if signedIn();
+      allow write: if signedIn() && request.auth.uid == userId;
+      allow delete: if signedIn() && request.auth.uid == userId;
+    }
+
     match /mergeRequests/{mergeRequestId} {
       // Branch author can create; parent doc owner or branch author can read/update
       allow create: if signedIn() &&

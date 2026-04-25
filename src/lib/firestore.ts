@@ -19,6 +19,7 @@ import type {
   ChatMessage,
   Comment,
   Document,
+  DocumentPresence,
   PendingUser,
   University,
   User,
@@ -249,6 +250,32 @@ export function buildUserFromProfile(input: {
 
 // Merge requests are stored directly on the branch Document — no separate collection needed.
 // This means we only need the already-deployed /documents rules.
+
+const DOCUMENT_PRESENCE = "documentPresence";
+
+export async function upsertDocumentPresence(
+  documentId: string,
+  userId: string,
+  data: Omit<DocumentPresence, "userId">,
+) {
+  const ref = doc(getDbOrThrow(), DOCUMENTS, documentId, DOCUMENT_PRESENCE, userId);
+  await setDoc(ref, { userId, ...data }, { merge: true });
+}
+
+export async function removeDocumentPresence(documentId: string, userId: string) {
+  const ref = doc(getDbOrThrow(), DOCUMENTS, documentId, DOCUMENT_PRESENCE, userId);
+  await deleteDoc(ref);
+}
+
+export function subscribeToDocumentPresence(
+  documentId: string,
+  onPresence: (presence: DocumentPresence[]) => void,
+) {
+  const ref = collection(getDbOrThrow(), DOCUMENTS, documentId, DOCUMENT_PRESENCE);
+  return onSnapshot(ref, (snap) => {
+    onPresence(snap.docs.map((d) => d.data() as DocumentPresence));
+  });
+}
 
 export async function getBranchDocumentsForParent(parentDocumentId: string): Promise<Document[]> {
   const q = query(collection(getDbOrThrow(), DOCUMENTS), where("parentDocumentId", "==", parentDocumentId));

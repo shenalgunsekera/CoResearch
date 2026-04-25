@@ -1,10 +1,12 @@
 "use client";
 
 import { type ChangeEvent, type MouseEvent as ReactMouseEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Plugin, PluginKey } from "@tiptap/pm/state";
+import { Decoration, DecorationSet } from "@tiptap/pm/view";
 import { useParams, useRouter, useSearchParams } from "next/navigation";
 import NextImage from "next/image";
 import { useAuth } from "@/lib/auth-context";
-import { type Comment, type Document, type User, type Version } from "@/lib/types";
+import { type Comment, type Document, type DocumentPresence, type User, type Version } from "@/lib/types";
 import {
   addCommentToDocument,
   createDocument,
@@ -12,8 +14,11 @@ import {
   getCommentsForDocument,
   getDocumentById,
   getUserByEmail,
+  removeDocumentPresence,
   subscribeToDocumentById,
+  subscribeToDocumentPresence,
   updateDocument,
+  upsertDocumentPresence,
 } from "@/lib/firestore";
 import { deleteDocumentImageByUrl, isFirebaseStorageUrl, uploadDocumentCover, uploadDocumentImage } from "@/lib/storage";
 import { Button } from "@/components/ui/button";
@@ -635,6 +640,49 @@ function applyImageFormatting(img: HTMLImageElement, widthPercent: number, align
   }
 }
 
+const PRESENCE_COLORS = ["#ef4444", "#f97316", "#eab308", "#22c55e", "#06b6d4", "#3b82f6", "#8b5cf6", "#ec4899"];
+
+function presenceColor(userId: string): string {
+  let hash = 0;
+  for (let i = 0; i < userId.length; i++) {
+    hash = (hash * 31 + userId.charCodeAt(i)) >>> 0;
+  }
+  return PRESENCE_COLORS[hash % PRESENCE_COLORS.length];
+}
+
+const cursorPluginKey = new PluginKey("collaborativeCursors");
+
+function buildCursorExtension(presenceRef: React.MutableRefObject<DocumentPresence[]>) {
+  return Extension.create({
+    name: "collaborativeCursors",
+    addProseMirrorPlugins() {
+      return [
+        new Plugin({
+          key: cursorPluginKey,
+          props: {
+            decorations(state) {
+              const decorations: Decoration[] = [];
+              const docSize = state.doc.content.size;
+              for (const p of presenceRef.current) {
+                if (p.cursorFrom === null || p.cursorFrom === undefined) continue;
+                const pos = Math.max(0, Math.min(p.cursorFrom, docSize));
+                const cursorEl = window.document.createElement("span");
+                cursorEl.style.cssText = `position:relative;border-left:2px solid ${p.color};margin-left:-1px;`;
+                const labelEl = window.document.createElement("span");
+                labelEl.textContent = p.userName.split(" ")[0];
+                labelEl.style.cssText = `position:absolute;top:-1.4em;left:-1px;background:${p.color};color:#fff;font-size:10px;padding:1px 5px;border-radius:3px 3px 3px 0;white-space:nowrap;pointer-events:none;z-index:50;font-family:sans-serif;line-height:1.4;`;
+                cursorEl.appendChild(labelEl);
+                decorations.push(Decoration.widget(pos, cursorEl, { side: 1, key: p.userId }));
+              }
+              return DecorationSet.create(state.doc, decorations);
+            },
+          },
+        }),
+      ];
+    },
+  });
+}
+
 export default function DocumentEditorPage() {
   const params = useParams<{ id: string }>();
   const id = params.id;
@@ -716,6 +764,11 @@ export default function DocumentEditorPage() {
   const [newComment, setNewComment] = useState("");
   const [commentSubmitting, setCommentSubmitting] = useState(false);
 
+  const [otherPresence, setOtherPresence] = useState<DocumentPresence[]>([]);
+  const otherPresenceRef = useRef<DocumentPresence[]>([]);
+  const presenceThrottleRef = useRef(0);
+  const cursorExtension = useMemo(() => buildCursorExtension(otherPresenceRef), []);
+
   const draftDocument = useMemo(() => (isNewDocument && user ? buildDraftDocument(user) : null), [isNewDocument, user]);
   const document = isNewDocument ? draftDocument : persistedDocument;
   const collaborators = useMemo(() => document?.collaborators ?? [], [document]);
@@ -788,6 +841,7 @@ export default function DocumentEditorPage() {
       TextStyle,
       TextStyleAttributes,
       Color,
+      cursorExtension,
     ],
     content: baseContent,
     editable: canEdit,
@@ -812,6 +866,60 @@ export default function DocumentEditorPage() {
   useEffect(() => {
     setTrackedImageUrls(extractImageUrlsFromHtml(baseContent));
   }, [baseContent]);
+
+  // Presence: write on mount, subscribe to others, clean up on unmount
+  useEffect(() => {
+    if (!user || !document || isNewDocument) return;
+    const docId = document.id;
+    const color = presenceColor(user.id);
+    void upsertDocumentPresence(docId, user.id, {
+      userName: user.name,
+      color,
+      cursorFrom: null,
+      lastSeen: new Date().toISOString(),
+    });
+    const unsubscribe = subscribeToDocumentPresence(docId, (all) => {
+      const others = all.filter((p) => p.userId !== user.id);
+      setOtherPresence(others);
+      otherPresenceRef.current = others;
+    });
+    const handleUnload = () => void removeDocumentPresence(docId, user.id);
+    window.addEventListener("beforeunload", handleUnload);
+    return () => {
+      void removeDocumentPresence(docId, user.id);
+      unsubscribe();
+      window.removeEventListener("beforeunload", handleUnload);
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user?.id, document?.id, isNewDocument]);
+
+  // Presence: re-render cursor decorations when other users' presence changes
+  useEffect(() => {
+    if (!editor) return;
+    editor.view.dispatch(editor.state.tr.setMeta(cursorPluginKey, { refresh: true }));
+  }, [editor, otherPresence]);
+
+  // Presence: track current user's cursor position (throttled to 500 ms)
+  useEffect(() => {
+    if (!editor || !user || !document || isNewDocument) return;
+    const docId = document.id;
+    const color = presenceColor(user.id);
+    const handleSelection = () => {
+      const now = Date.now();
+      if (now - presenceThrottleRef.current < 500) return;
+      presenceThrottleRef.current = now;
+      const { from } = editor.state.selection;
+      void upsertDocumentPresence(docId, user.id, {
+        userName: user.name,
+        color,
+        cursorFrom: from,
+        lastSeen: new Date().toISOString(),
+      });
+    };
+    editor.on("selectionUpdate", handleSelection);
+    return () => { editor.off("selectionUpdate", handleSelection); };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editor, user?.id, document?.id, isNewDocument]);
 
   useEffect(() => {
     editorModeRef.current = editorMode;
@@ -1959,6 +2067,19 @@ export default function DocumentEditorPage() {
             </div>
           </div>
           <div className="flex items-center gap-2">
+            {otherPresence.length > 0 && (
+              <div className="flex items-center gap-1" title={otherPresence.map((p) => p.userName).join(", ") + " online"}>
+                {otherPresence.slice(0, 5).map((p) => (
+                  <div key={p.userId} title={`${p.userName} is viewing`} className="relative flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-[10px] font-semibold text-white ring-2 ring-white" style={{ backgroundColor: p.color }}>
+                    {p.userName.split(" ").map((n) => n[0]).join("").slice(0, 2).toUpperCase()}
+                    <span className="absolute -bottom-0.5 -right-0.5 h-2.5 w-2.5 rounded-full border-2 border-white bg-green-500" />
+                  </div>
+                ))}
+                {otherPresence.length > 5 && (
+                  <span className="text-xs text-gray-500">+{otherPresence.length - 5}</span>
+                )}
+              </div>
+            )}
             <Badge variant="outline">v{document.currentVersion}</Badge>
             {isDiscoverReadOnlyView && <Badge className="bg-green-100 text-green-800">Published read-only</Badge>}
             {hasChanges && <Badge className="bg-amber-100 text-amber-800">Unsaved changes</Badge>}

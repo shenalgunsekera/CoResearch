@@ -135,6 +135,14 @@ export interface ChatMessage {
   channel: string;
 }
 
+export interface DocumentPresence {
+  userId: string;
+  userName: string;
+  color: string;
+  cursorFrom: number | null;
+  lastSeen: string;
+}
+
 export interface PendingUser {
   id: string;
   userId?: string;
