@@ -1575,11 +1575,14 @@ export default function DocumentEditorPage() {
       const liveImageUrls = uniqueUrls([...extractImageUrlsFromHtml(liveContent), ...trackedImageUrls]);
       const label = branchName.trim() || "Branch";
       const now = new Date().toISOString();
+      const branchCollaboratorIds = Array.from(new Set([...collaborators.map((c) => c.id), user.id]));
       const payload: Omit<Document, "id"> & { collaboratorIds: string[] } = {
         ...document,
         title: `${effectiveTitle} [${label}]`,
         content: liveContent,
         imageUrls: liveImageUrls,
+        ownerId: user.id,
+        ownerName: user.name,
         versions: [...document.versions, { id: `v${document.versions.length + 1}`, version: document.versions.length + 1, content: liveContent, author: user.name, authorId: user.id, timestamp: now, message: `Created branch: ${label}`, changes: [] }],
         currentVersion: document.versions.length + 1,
         createdAt: now,
@@ -1588,7 +1591,7 @@ export default function DocumentEditorPage() {
         parentDocumentId: document.id,
         branchLabel: label,
         branchAncestorContent: liveContent,
-        collaboratorIds: collaborators.map((c) => c.id),
+        collaboratorIds: branchCollaboratorIds,
       };
       const createdId = await createDocument(payload);
       setBranchOpen(false);
