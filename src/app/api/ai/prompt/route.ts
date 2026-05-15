@@ -1,9 +1,3 @@
-/**
- * AI Prompt Assistant — uses Groq (llama-3.1-8b-instant) for fast inference.
- *
- * Get a free key at https://console.groq.com and add to .env.local:
- *   GROQ_API_KEY=your-key-here
- */
 
 import Groq from "groq-sdk";
 import { NextResponse } from "next/server";

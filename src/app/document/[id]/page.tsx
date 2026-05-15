@@ -11,6 +11,7 @@ import {
   addCommentToDocument,
   createDocument,
   getBranchDocumentsForParent,
+  subscribeToBranchDocuments,
   getCommentsForDocument,
   getDocumentById,
   getUserByEmail,
@@ -786,7 +787,17 @@ export default function DocumentEditorPage() {
     isPublishedView &&
     document.stage === "published" &&
     (document.publishVisibility ?? "public") === "public";
-  const canEdit = !!user && hasEditorRole && !isDiscoverReadOnlyView;
+  // Branch is locked while its merge request is pending or already merged
+  const mergeRequestLocked =
+    !!document?.parentDocumentId &&
+    (document.mergeRequestStatus === "pending" || document.mergeRequestStatus === "merged");
+  // Published documents are permanently read-only regardless of how they're accessed
+  const canEdit =
+    !!user &&
+    hasEditorRole &&
+    !isDiscoverReadOnlyView &&
+    !mergeRequestLocked &&
+    document?.stage !== "published";
   const canInvite = canManageDocument && !isDiscoverReadOnlyView;
   const canPublish = !!document && canManageDocument && !isNewDocument && !document.parentDocumentId && !isDiscoverReadOnlyView;
   const canCreateBranch = !!document && !document.parentDocumentId && hasEditorRole && !isDiscoverReadOnlyView;
@@ -1139,25 +1150,33 @@ export default function DocumentEditorPage() {
       },
     );
 
-    async function loadDocumentMetadata() {
-      // Load branch docs + parent title separately — non-critical
+    // Load parent title if on a branch (one-time is fine — title rarely changes)
+    async function loadParentTitle() {
       try {
         const loadedDoc = await getDocumentById(id);
         if (loadedDoc?.parentDocumentId) {
-          // On a branch: fetch parent title
           const parentDoc = await getDocumentById(loadedDoc.parentDocumentId);
           if (parentDoc) setParentDocTitle(parentDoc.title);
-        } else if (loadedDoc) {
-          // On a parent: load all branch documents
-          const branches = await getBranchDocumentsForParent(loadedDoc.id);
-          setBranchDocs(branches);
         }
       } catch {
         // Silently ignore
       }
     }
-    void loadDocumentMetadata();
-    return () => unsubscribe();
+    void loadParentTitle();
+
+    // Subscribe to branch documents in real time — parent owner sees new merge requests instantly
+    let unsubBranches: (() => void) | null = null;
+    getDocumentById(id).then((loadedDoc) => {
+      if (!loadedDoc || loadedDoc.parentDocumentId) return; // Only for parent docs
+      unsubBranches = subscribeToBranchDocuments(loadedDoc.id, (branches) => {
+        setBranchDocs(branches);
+      });
+    }).catch(() => undefined);
+
+    return () => {
+      unsubscribe();
+      unsubBranches?.();
+    };
   }, [editor, id, isLoading, isNewDocument, router, user]);
 
   useEffect(() => {
@@ -1653,9 +1672,19 @@ export default function DocumentEditorPage() {
   };
 
   const handleRestoreVersion = () => {
-    if (!selectedVersion) return;
+    if (!selectedVersion || !document) return;
+    const version = document.versions.find((v) => v.version === selectedVersion);
+    if (!version) return;
+    const restoredHtml = markdownToBasicHtml(version.content);
+    // Push the historical content into tracked editor state so hasChanges becomes true
+    setEditorHtml(restoredHtml);
+    if (editorModeRef.current === "quill") {
+      quillInstanceRef.current?.clipboard.dangerouslyPasteHTML(restoredHtml);
+    } else {
+      editor?.commands.setContent(restoredHtml, { emitUpdate: false });
+    }
     setSelectedVersion(null);
-    toast.success("Version restored.");
+    toast.success(`Restored to v${selectedVersion} — save to keep this version.`);
   };
 
   const handleInviteCollaborator = async () => {
@@ -1665,8 +1694,10 @@ export default function DocumentEditorPage() {
     setInviteLoading(true);
     try {
       const invitedUser = await getUserByEmail(inviteEmail.trim().toLowerCase());
-      if (!invitedUser) return toast.error("User not found.");
-      if (collaborators.some((c) => c.id === invitedUser.id)) return toast.error("Already a collaborator.");
+      if (!invitedUser) return toast.error("No account found with that email.");
+      if (!invitedUser.verified) return toast.error("That user hasn't been verified by their university yet.");
+      if (invitedUser.university?.name !== document.university) return toast.error("You can only invite users from the same university.");
+      if (collaborators.some((c) => c.id === invitedUser.id)) return toast.error("This person is already a collaborator.");
       const nextCollaborators = [...collaborators, { id: invitedUser.id, name: invitedUser.name, email: invitedUser.email, role: inviteRole, joinedAt: new Date().toISOString() }];
       const updatedAt = new Date().toISOString();
       await updateDocument(document.id, { collaborators: nextCollaborators, collaboratorIds: nextCollaborators.map((c) => c.id), updatedAt });
@@ -1732,33 +1763,39 @@ export default function DocumentEditorPage() {
     }
   };
 
-  // Branch author submits a merge request — stored on the branch document itself
+  // Branch author submits (or re-submits) a merge request
   const handleRequestMerge = async () => {
     if (!document?.parentDocumentId || !user) return;
     if (document.mergeRequestStatus === "pending") return toast.info("A merge request is already pending review.");
+    if (document.mergeRequestStatus === "merged") return toast.info("This branch has already been merged.");
     setMergeRequestLoading(true);
     try {
-      // Save latest content first so the reviewer sees it
-      await handleSave("Auto-saved before merge request");
+      // Save latest content first so the reviewer always sees the freshest version
+      await handleSave(
+        document.mergeRequestStatus === "rejected"
+          ? "Updated before resubmitting merge request"
+          : "Auto-saved before merge request",
+      );
       const now = new Date().toISOString();
-      await updateDocument(document.id, {
-        mergeRequestStatus: "pending",
+      const updates = {
+        mergeRequestStatus: "pending" as const,
         mergeRequestMessage: mergeRequestMsg.trim() || "Requesting to merge branch changes",
         mergeRequestCreatedAt: now,
         mergeRequestAuthorId: user.id,
         mergeRequestAuthorName: user.name,
-      });
-      setPersistedDocument((prev) => prev ? {
-        ...prev,
-        mergeRequestStatus: "pending",
-        mergeRequestMessage: mergeRequestMsg.trim() || "Requesting to merge branch changes",
-        mergeRequestCreatedAt: now,
-        mergeRequestAuthorId: user.id,
-        mergeRequestAuthorName: user.name,
-      } : prev);
+        // Clear previous rejection metadata
+        mergeRequestResolvedAt: undefined,
+        mergeRequestResolvedBy: undefined,
+      };
+      await updateDocument(document.id, updates);
+      setPersistedDocument((prev) => prev ? { ...prev, ...updates } : prev);
       setMergeRequestOpen(false);
       setMergeRequestMsg("");
-      toast.success("Merge request submitted. The document owner will review it.");
+      toast.success(
+        document.mergeRequestStatus === "rejected"
+          ? "Merge request resubmitted."
+          : "Merge request submitted. The document owner will review it.",
+      );
     } catch (err) {
       toast.error(`Failed to submit: ${getErrorMessage(err)}`);
     } finally {
@@ -1766,15 +1803,18 @@ export default function DocumentEditorPage() {
     }
   };
 
-  // Parent doc owner opens the merge review dialog for a branch document
+  // Parent doc owner opens the merge review dialog — always fetches latest branch snapshot first
   const handleOpenMergeReview = async (branchDoc: Document) => {
     if (!document) return;
     try {
-      const ancestor = branchDoc.branchAncestorContent ?? branchDoc.versions[0]?.content ?? "";
-      const blocks = threeWayDiff(ancestor, document.content, branchDoc.content);
+      // Re-fetch the branch to guarantee we're diffing the latest saved content
+      const latestBranch = await getDocumentById(branchDoc.id);
+      const fresh = latestBranch ?? branchDoc;
+      const ancestor = fresh.branchAncestorContent ?? fresh.versions[0]?.content ?? "";
+      const blocks = threeWayDiff(ancestor, document.content, fresh.content);
       setMergeDiffBlocks(blocks);
       setMergeResolutions(new Map());
-      setActiveBranchDoc(branchDoc);
+      setActiveBranchDoc(fresh);
       setMergeReviewOpen(true);
     } catch (err) {
       toast.error(`Failed to load branch: ${getErrorMessage(err)}`);
@@ -2163,27 +2203,48 @@ export default function DocumentEditorPage() {
         </div>
       </header>
 
-      {/* Branch isolation banner */}
-      {document.parentDocumentId && (
-        <div className="border-b bg-amber-50 px-4 py-2 sm:px-6 lg:px-8">
-          <div className="mx-auto flex max-w-7xl flex-wrap items-center gap-x-3 gap-y-1">
-            <GitBranch className="h-3.5 w-3.5 shrink-0 text-amber-600" />
-            <span className="text-xs font-semibold text-amber-700">Branch</span>
-            {document.branchLabel && (
-              <span className="rounded bg-amber-100 px-1.5 py-0.5 font-mono text-xs text-amber-800">{document.branchLabel}</span>
-            )}
-            <span className="text-xs text-amber-600">of</span>
-            <button
-              type="button"
-              className="text-xs font-medium text-amber-700 underline underline-offset-2 hover:text-amber-900"
-              onClick={() => document.parentDocumentId && router.push(`/document/${document.parentDocumentId}`)}
-            >
-              {parentDocTitle ?? "original document"}
-            </button>
-            <span className="ml-auto text-xs text-amber-600">Changes saved here are isolated — the original stays unchanged until the owner merges.</span>
+      {/* Branch status banner — changes colour and message based on merge request state */}
+      {document.parentDocumentId && (() => {
+        const mrs = document.mergeRequestStatus;
+        const isPending  = mrs === "pending";
+        const isMerged   = mrs === "merged";
+        const isRejected = mrs === "rejected";
+        const bannerCls = isPending
+          ? "border-b bg-blue-50 text-blue-800"
+          : isMerged
+          ? "border-b bg-green-50 text-green-800"
+          : isRejected
+          ? "border-b bg-red-50 text-red-800"
+          : "border-b bg-amber-50 text-amber-800";
+        const iconEl = isPending  ? <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+                     : isMerged   ? <Check className="h-3.5 w-3.5 shrink-0" />
+                     : isRejected ? <X className="h-3.5 w-3.5 shrink-0" />
+                                  : <GitBranch className="h-3.5 w-3.5 shrink-0" />;
+        const message = isPending
+          ? "Merge request pending — editing is locked while the owner reviews your changes."
+          : isMerged
+          ? "This branch has been merged into the original document. No further edits are needed."
+          : isRejected
+          ? `Merge request rejected by ${document.mergeRequestResolvedBy ?? "the owner"}. Make your changes and resubmit.`
+          : "Changes here are isolated — the original stays unchanged until the owner merges.";
+        return (
+          <div className={`px-4 py-2 sm:px-6 lg:px-8 ${bannerCls}`}>
+            <div className="mx-auto flex max-w-7xl flex-wrap items-center gap-x-3 gap-y-1">
+              {iconEl}
+              <span className="text-xs font-semibold">Branch{document.branchLabel ? ` — ${document.branchLabel}` : ""}</span>
+              <span className="text-xs">of</span>
+              <button
+                type="button"
+                className="text-xs font-medium underline underline-offset-2 opacity-80 hover:opacity-100"
+                onClick={() => document.parentDocumentId && router.push(`/document/${document.parentDocumentId}`)}
+              >
+                {parentDocTitle ?? "original document"}
+              </button>
+              <span className="ml-auto text-xs opacity-75">{message}</span>
+            </div>
           </div>
-        </div>
-      )}
+        );
+      })()}
 
       {isDiscoverReadOnlyView && (
         <div className="border-b bg-green-50 px-4 py-2 sm:px-6 lg:px-8">
@@ -2439,25 +2500,43 @@ export default function DocumentEditorPage() {
                   // Branch view — show this branch's own merge request status
                   document.mergeRequestStatus ? (
                     <div className={`rounded-lg border p-2.5 text-xs ${
-                      document.mergeRequestStatus === "pending" ? "border-amber-300 bg-amber-50" :
-                      document.mergeRequestStatus === "merged"  ? "border-green-200 bg-green-50" :
-                                                                   "border-gray-200 bg-gray-50"
+                      document.mergeRequestStatus === "pending"  ? "border-amber-300 bg-amber-50" :
+                      document.mergeRequestStatus === "merged"   ? "border-green-200 bg-green-50" :
+                      document.mergeRequestStatus === "rejected" ? "border-red-200 bg-red-50" :
+                                                                    "border-gray-200 bg-gray-50"
                     }`}>
-                      <div className="flex items-center gap-1">
+                      <div className="flex items-center justify-between gap-1">
                         <span className={`inline-flex items-center gap-0.5 rounded-full px-1.5 py-0.5 text-[10px] font-semibold ${
-                          document.mergeRequestStatus === "pending" ? "bg-amber-100 text-amber-700" :
-                          document.mergeRequestStatus === "merged"  ? "bg-green-100 text-green-700" :
-                                                                       "bg-gray-100 text-gray-500"
+                          document.mergeRequestStatus === "pending"  ? "bg-amber-100 text-amber-700" :
+                          document.mergeRequestStatus === "merged"   ? "bg-green-100 text-green-700" :
+                          document.mergeRequestStatus === "rejected" ? "bg-red-100 text-red-700" :
+                                                                        "bg-gray-100 text-gray-500"
                         }`}>
-                          {document.mergeRequestStatus === "pending" && <AlertTriangle className="h-2.5 w-2.5" />}
-                          {document.mergeRequestStatus === "merged"  && <Check className="h-2.5 w-2.5" />}
+                          {document.mergeRequestStatus === "pending"  && <AlertTriangle className="h-2.5 w-2.5" />}
+                          {document.mergeRequestStatus === "merged"   && <Check className="h-2.5 w-2.5" />}
                           {document.mergeRequestStatus === "rejected" && <X className="h-2.5 w-2.5" />}
                           {document.mergeRequestStatus.charAt(0).toUpperCase() + document.mergeRequestStatus.slice(1)}
                         </span>
+                        {document.mergeRequestStatus === "rejected" && (
+                          <button
+                            type="button"
+                            onClick={() => { setMergeRequestMsg(""); setMergeRequestOpen(true); }}
+                            className="rounded bg-red-500 px-2 py-0.5 text-[10px] font-semibold text-white hover:bg-red-600 transition-colors"
+                          >
+                            Resubmit
+                          </button>
+                        )}
                       </div>
                       {document.mergeRequestMessage && <p className="mt-1 italic text-gray-500 line-clamp-2">&quot;{document.mergeRequestMessage}&quot;</p>}
                       {document.mergeRequestCreatedAt && <p className="mt-1 text-gray-400">Submitted {new Date(document.mergeRequestCreatedAt).toLocaleDateString(undefined, { month: "short", day: "numeric" })}</p>}
-                      {document.mergeRequestResolvedBy && <p className="mt-0.5 text-gray-400">{document.mergeRequestStatus === "merged" ? "Merged" : "Rejected"} by {document.mergeRequestResolvedBy}</p>}
+                      {document.mergeRequestResolvedBy && (
+                        <p className="mt-0.5 text-gray-400">
+                          {document.mergeRequestStatus === "merged" ? "Merged" : "Rejected"} by {document.mergeRequestResolvedBy}
+                        </p>
+                      )}
+                      {document.mergeRequestStatus === "rejected" && (
+                        <p className="mt-1.5 text-red-600 font-medium">Make your changes above and resubmit.</p>
+                      )}
                     </div>
                   ) : (
                     <div className="flex flex-col items-center gap-1.5 rounded-lg border border-dashed border-gray-200 py-5 text-center">
@@ -2560,18 +2639,19 @@ export default function DocumentEditorPage() {
                 </Button>
               )}
               {/* Request Merge: shown on branch documents */}
-              {document.parentDocumentId && canEdit && (
+              {document.parentDocumentId && (
                 <Button
                   size="sm"
-                  variant={document.mergeRequestStatus === "pending" ? "outline" : "default"}
+                  variant={document.mergeRequestStatus === "pending" || document.mergeRequestStatus === "merged" ? "outline" : document.mergeRequestStatus === "rejected" ? "destructive" : "default"}
                   className="w-full justify-start"
                   disabled={document.mergeRequestStatus === "pending" || document.mergeRequestStatus === "merged"}
                   onClick={() => { setMergeRequestMsg(""); setMergeRequestOpen(true); }}
                 >
                   <GitMerge className="mr-2 h-4 w-4 shrink-0" />
-                  {document.mergeRequestStatus === "pending" ? "Merge Requested ✓" :
-                   document.mergeRequestStatus === "merged"  ? "Already Merged" :
-                                                               "Request Merge"}
+                  {document.mergeRequestStatus === "pending"  ? "Merge Request Pending…" :
+                   document.mergeRequestStatus === "merged"   ? "Already Merged" :
+                   document.mergeRequestStatus === "rejected" ? "Resubmit Merge Request" :
+                                                                "Request Merge"}
                 </Button>
               )}
               <Button data-tour-id="document-export" variant={isDiscoverReadOnlyView ? "default" : "outline"} size="sm" className="w-full justify-start" onClick={handleExportPdf}><Download className="mr-2 h-4 w-4 shrink-0" />Download PDF</Button>
@@ -2680,12 +2760,19 @@ export default function DocumentEditorPage() {
         </DialogContent>
       </Dialog>
 
-      {/* Branch author: submit merge request */}
+      {/* Branch author: submit / resubmit merge request */}
       <Dialog open={mergeRequestOpen} onOpenChange={setMergeRequestOpen}>
         <DialogContent className="w-full max-w-sm sm:max-w-md">
           <DialogHeader>
-            <DialogTitle className="flex items-center gap-2"><GitMerge className="h-4 w-4" />Request Merge</DialogTitle>
-            <DialogDescription>Ask the original document owner to review and merge your branch changes.</DialogDescription>
+            <DialogTitle className="flex items-center gap-2">
+              <GitMerge className="h-4 w-4" />
+              {document.mergeRequestStatus === "rejected" ? "Resubmit Merge Request" : "Request Merge"}
+            </DialogTitle>
+            <DialogDescription>
+              {document.mergeRequestStatus === "rejected"
+                ? "Your previous request was rejected. Your changes have been updated — describe what you changed and resubmit for review."
+                : "Ask the original document owner to review and merge your branch changes."}
+            </DialogDescription>
           </DialogHeader>
           <div className="space-y-2">
             <Label htmlFor="merge-msg">Description (optional)</Label>

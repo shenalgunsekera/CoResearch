@@ -4,13 +4,12 @@ import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { useAuth } from "@/lib/auth-context";
 import { Document } from "@/lib/types";
-import { deleteDocumentById, getDocumentsForUser } from "@/lib/firestore";
+import { deleteDocumentById, subscribeToDocumentsForUser } from "@/lib/firestore";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
   Card,
   CardContent,
-  CardDescription,
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
@@ -30,6 +29,9 @@ import {
   User,
   Menu,
   X as XIcon,
+  GitBranch,
+  GitMerge,
+  Clock,
 } from "lucide-react";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { toast } from "sonner";
@@ -59,19 +61,14 @@ export default function DashboardPage() {
   }, [isLoading, user, router]);
 
   useEffect(() => {
-    async function loadDocuments() {
-      if (!user) return;
-      setLoadingDocs(true);
-      try {
-        const data = await getDocumentsForUser(user.id);
-        setDocuments(data);
-      } finally {
-        setLoadingDocs(false);
-      }
-    }
-
-    loadDocuments();
-  }, [user]);
+    if (!user) return;
+    setLoadingDocs(true);
+    const unsub = subscribeToDocumentsForUser(user.id, (data) => {
+      setDocuments(data);
+      setLoadingDocs(false);
+    });
+    return unsub;
+  }, [user?.id]);
 
   useEffect(() => {
     if (!user || loadingDocs) return;
@@ -96,13 +93,94 @@ export default function DashboardPage() {
 
   const getStageColor = (stage: Document["stage"]) => {
     switch (stage) {
-      case "draft":
-        return "bg-gray-100 text-gray-800";
-      case "review":
-        return "bg-blue-100 text-blue-800";
-      case "published":
-        return "bg-green-100 text-green-800";
+      case "draft":     return "bg-gray-100 text-gray-700";
+      case "review":    return "bg-blue-100 text-blue-800";
+      case "published": return "bg-green-100 text-green-800";
     }
+  };
+
+  const getMergeStatusColor = (status: Document["mergeRequestStatus"]) => {
+    switch (status) {
+      case "pending":  return "bg-amber-100 text-amber-800";
+      case "merged":   return "bg-green-100 text-green-800";
+      case "rejected": return "bg-red-100 text-red-700";
+      default:         return null;
+    }
+  };
+
+  // Shared card used across all three tabs
+  const DocCard = ({ doc }: { doc: Document }) => {
+    const isBranch = !!doc.parentDocumentId;
+    const versionLabel = doc.currentVersion > 0 ? `v${doc.currentVersion}` : "Draft";
+    const mergeColor = getMergeStatusColor(doc.mergeRequestStatus);
+    const isOwner = doc.ownerId === user.id;
+
+    return (
+      <Card
+        className="group hover:shadow-md transition-all cursor-pointer border border-gray-200"
+        onClick={() => router.push(`/document/${doc.id}`)}
+      >
+        <CardContent className="p-4">
+          {/* Top row: title + stage badge + delete */}
+          <div className="flex items-start gap-3">
+            <div className="flex-1 min-w-0">
+              <div className="flex items-center gap-2 mb-0.5 flex-wrap">
+                {isBranch && (
+                  <span className="inline-flex items-center gap-1 rounded-full bg-amber-50 border border-amber-200 px-1.5 py-0.5 text-[10px] font-semibold text-amber-700 shrink-0">
+                    <GitBranch className="h-2.5 w-2.5" />Branch
+                  </span>
+                )}
+                {doc.mergeRequestStatus && mergeColor && (
+                  <span className={`inline-flex items-center gap-1 rounded-full px-1.5 py-0.5 text-[10px] font-semibold shrink-0 ${mergeColor}`}>
+                    <GitMerge className="h-2.5 w-2.5" />
+                    {doc.mergeRequestStatus.charAt(0).toUpperCase() + doc.mergeRequestStatus.slice(1)}
+                  </span>
+                )}
+              </div>
+              {/* Title — truncates cleanly */}
+              <h3 className="font-semibold text-gray-900 text-sm leading-snug line-clamp-2 wrap-break-word">
+                {doc.title}
+              </h3>
+            </div>
+
+            <div className="flex items-center gap-1.5 shrink-0">
+              <Badge className={`text-xs ${getStageColor(doc.stage)}`}>
+                {doc.stage.charAt(0).toUpperCase() + doc.stage.slice(1)}
+              </Badge>
+              {isOwner && (
+                <button
+                  type="button"
+                  title="Delete project"
+                  className="rounded p-1 text-gray-300 opacity-0 group-hover:opacity-100 hover:bg-red-50 hover:text-red-500 transition-all"
+                  onClick={(e) => openDeleteDialog(doc, e)}
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                </button>
+              )}
+            </div>
+          </div>
+
+          {/* Bottom row: meta */}
+          <div className="mt-2.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-gray-400">
+            <span className="flex items-center gap-1">
+              <Clock className="h-3 w-3" />
+              {new Date(doc.updatedAt).toLocaleDateString()}
+            </span>
+            <span className="flex items-center gap-1">
+              <Users className="h-3 w-3" />
+              {doc.collaborators.length}
+            </span>
+            <span className="flex items-center gap-1">
+              <FileText className="h-3 w-3" />
+              {versionLabel}
+            </span>
+            {!isOwner && (
+              <span className="text-gray-400">by {doc.ownerName}</span>
+            )}
+          </div>
+        </CardContent>
+      </Card>
+    );
   };
 
   const openDeleteDialog = (doc: Document, event: React.MouseEvent) => {
@@ -366,144 +444,39 @@ export default function DashboardPage() {
             <TabsTrigger value="collaborating">Collaborating</TabsTrigger>
           </TabsList>
 
-          <TabsContent value="all" className="space-y-4 mt-6">
-            {loadingDocs ? (
-              <Card>
-                <CardContent className="py-12 text-center text-sm text-gray-600">
-                  Loading projects...
-                </CardContent>
-              </Card>
-            ) : filteredDocuments.length === 0 ? (
+          {/* Shared empty / loading state */}
+          {loadingDocs && (
+            <div className="py-12 text-center text-sm text-gray-400">Loading projects…</div>
+          )}
+
+          <TabsContent value="all" className="space-y-3 mt-4">
+            {!loadingDocs && filteredDocuments.length === 0 && (
               <Card>
                 <CardContent className="py-12 text-center">
-                  <FileText className="w-12 h-12 text-gray-400 mx-auto mb-4" />
-                  <h3 className="text-lg font-medium text-gray-900 mb-2">
-                    No projects found
-                  </h3>
-                  <p className="text-gray-600 mb-4">
-                    Start your first research project or search for collaborators
-                  </p>
+                  <FileText className="w-12 h-12 text-gray-300 mx-auto mb-4" />
+                  <h3 className="text-lg font-medium text-gray-900 mb-2">No projects found</h3>
+                  <p className="text-gray-500 mb-4 text-sm">Start your first research project or search for collaborators</p>
                   <Button onClick={() => router.push("/document/new")}>
-                    <Plus className="w-4 h-4 mr-2" />
-                    Create New Paper
+                    <Plus className="w-4 h-4 mr-2" />Create New Paper
                   </Button>
                 </CardContent>
               </Card>
-            ) : (
-              filteredDocuments.map((doc) => (
-                <Card
-                  key={doc.id}
-                  className="hover:shadow-md transition-shadow cursor-pointer"
-                  onClick={() => router.push(`/document/${doc.id}`)}
-                >
-                  <CardHeader>
-                    <div className="flex justify-between items-start">
-                      <div className="flex-1">
-                        <CardTitle className="mb-2">{doc.title}</CardTitle>
-                        <div className="flex items-center gap-2 text-sm text-gray-600">
-                          <span>by {doc.ownerName}</span>
-                          <span>&bull;</span>
-                          <span>{new Date(doc.updatedAt).toLocaleDateString()}</span>
-                        </div>
-                      </div>
-                      <Badge className={getStageColor(doc.stage)}>
-                        {doc.stage.charAt(0).toUpperCase() + doc.stage.slice(1)}
-                      </Badge>
-                    </div>
-                  </CardHeader>
-                  <CardContent>
-                    <div className="flex flex-wrap gap-2 mb-4">
-                      <Badge variant="outline">{doc.field}</Badge>
-                      <Badge variant="outline">{doc.topic}</Badge>
-                    </div>
-                    <div className="flex items-center justify-between text-sm text-gray-600">
-                      <div className="flex items-center gap-4">
-                        <div className="flex items-center gap-1">
-                          <Users className="w-4 h-4" />
-                          <span>{doc.collaborators.length} collaborators</span>
-                        </div>
-                        <div className="flex items-center gap-1">
-                          <FileText className="w-4 h-4" />
-                          <span>v{doc.currentVersion}</span>
-                        </div>
-                      </div>
-                      {doc.ownerId === user.id && (
-                        <Button
-                          variant="destructive"
-                          size="sm"
-                          onClick={(event) => openDeleteDialog(doc, event)}
-                        >
-                          <Trash2 className="w-4 h-4 mr-2" />
-                          Delete
-                        </Button>
-                      )}
-                    </div>
-                  </CardContent>
-                </Card>
-              ))
             )}
+            {filteredDocuments.map((doc) => <DocCard key={doc.id} doc={doc} />)}
           </TabsContent>
 
-          <TabsContent value="owned" className="space-y-4 mt-6">
-            {filteredDocuments
-              .filter((doc) => doc.ownerId === user.id)
-              .map((doc) => (
-                <Card
-                  key={doc.id}
-                  className="hover:shadow-md transition-shadow cursor-pointer"
-                  onClick={() => router.push(`/document/${doc.id}`)}
-                >
-                  <CardHeader>
-                    <div className="flex justify-between items-start">
-                      <div className="flex-1">
-                        <CardTitle className="mb-2">{doc.title}</CardTitle>
-                        <CardDescription>
-                          Last updated {new Date(doc.updatedAt).toLocaleDateString()}
-                        </CardDescription>
-                      </div>
-                      <Badge className={getStageColor(doc.stage)}>
-                        {doc.stage.charAt(0).toUpperCase() + doc.stage.slice(1)}
-                      </Badge>
-                    </div>
-                    {doc.ownerId === user.id && (
-                      <div className="mt-4">
-                        <Button
-                          variant="destructive"
-                          size="sm"
-                          onClick={(event) => openDeleteDialog(doc, event)}
-                        >
-                          <Trash2 className="w-4 h-4 mr-2" />
-                          Delete
-                        </Button>
-                      </div>
-                    )}
-                  </CardHeader>
-                </Card>
-              ))}
+          <TabsContent value="owned" className="space-y-3 mt-4">
+            {!loadingDocs && filteredDocuments.filter((d) => d.ownerId === user.id).length === 0 && (
+              <div className="py-8 text-center text-sm text-gray-400">No papers you own yet.</div>
+            )}
+            {filteredDocuments.filter((d) => d.ownerId === user.id).map((doc) => <DocCard key={doc.id} doc={doc} />)}
           </TabsContent>
 
-          <TabsContent value="collaborating" className="space-y-4 mt-6">
-            {filteredDocuments
-              .filter((doc) => doc.ownerId !== user.id)
-              .map((doc) => (
-                <Card
-                  key={doc.id}
-                  className="hover:shadow-md transition-shadow cursor-pointer"
-                  onClick={() => router.push(`/document/${doc.id}`)}
-                >
-                  <CardHeader>
-                    <div className="flex justify-between items-start">
-                      <div className="flex-1">
-                        <CardTitle className="mb-2">{doc.title}</CardTitle>
-                        <CardDescription>by {doc.ownerName}</CardDescription>
-                      </div>
-                      <Badge className={getStageColor(doc.stage)}>
-                        {doc.stage.charAt(0).toUpperCase() + doc.stage.slice(1)}
-                      </Badge>
-                    </div>
-                  </CardHeader>
-                </Card>
-              ))}
+          <TabsContent value="collaborating" className="space-y-3 mt-4">
+            {!loadingDocs && filteredDocuments.filter((d) => d.ownerId !== user.id).length === 0 && (
+              <div className="py-8 text-center text-sm text-gray-400">No collaborations yet.</div>
+            )}
+            {filteredDocuments.filter((d) => d.ownerId !== user.id).map((doc) => <DocCard key={doc.id} doc={doc} />)}
           </TabsContent>
         </Tabs>
 

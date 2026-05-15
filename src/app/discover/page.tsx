@@ -10,7 +10,7 @@ import { db } from "@/lib/firebase";
 import { Document, ChatMessage, User } from "@/lib/types";
 import {
   addChatMessage,
-  getDiscoverDocuments,
+  subscribeToDiscoverDocuments,
 } from "@/lib/firestore";
 import { uploadChatImage } from "@/lib/storage";
 import { collection, onSnapshot, query, where } from "firebase/firestore";
@@ -54,17 +54,13 @@ export default function DiscoverPage() {
 
   useEffect(() => {
     if (!user) return;
-    async function loadDocuments() {
-      setLoadingData(true);
-      try {
-        const docs = await getDiscoverDocuments();
-        setDocuments(docs);
-      } finally {
-        setLoadingData(false);
-      }
-    }
-    loadDocuments();
-  }, [user]);
+    setLoadingData(true);
+    const unsub = subscribeToDiscoverDocuments((docs) => {
+      setDocuments(docs);
+      setLoadingData(false);
+    });
+    return unsub;
+  }, [user?.id]);
 
   // Auto-scroll to latest message
   useEffect(() => {

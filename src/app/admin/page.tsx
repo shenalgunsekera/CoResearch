@@ -6,7 +6,7 @@ import { useRouter } from "next/navigation";
 import { useAuth } from "@/lib/auth-context";
 import { PendingUser } from "@/lib/types";
 import {
-  getPendingUsers,
+  subscribeToPendingUsers,
   updatePendingUserStatus,
 } from "@/lib/firestore";
 import { Button } from "@/components/ui/button";
@@ -27,6 +27,7 @@ export default function AdminDashboard() {
   const router = useRouter();
   const [pendingUsers, setPendingUsers] = useState<PendingUser[]>([]);
   const [loadingPending, setLoadingPending] = useState(true);
+  const [actioningId, setActioningId] = useState<string | null>(null);
 
   useEffect(() => {
     if (!isLoading && !isAdmin) {
@@ -35,55 +36,40 @@ export default function AdminDashboard() {
   }, [isLoading, isAdmin, router]);
 
   useEffect(() => {
-    async function loadPendingUsers() {
-      if (!user?.university?.name) return;
-      setLoadingPending(true);
-      try {
-        const data = await getPendingUsers(user.university.name);
-        setPendingUsers(data);
-      } finally {
-        setLoadingPending(false);
-      }
-    }
-
-    loadPendingUsers();
-  }, [user]);
+    if (!user?.university?.name) return;
+    setLoadingPending(true);
+    const unsub = subscribeToPendingUsers(user.university.name, (data) => {
+      setPendingUsers(data);
+      setLoadingPending(false);
+    });
+    return unsub;
+  }, [user?.university?.name]);
 
   if (isLoading || !isAdmin) return null;
 
   const handleApprove = async (pendingUser: PendingUser) => {
+    if (actioningId) return;
+    setActioningId(pendingUser.id);
     try {
-      await updatePendingUserStatus(
-        pendingUser.id,
-        "approved",
-        pendingUser.userId ?? pendingUser.id,
-      );
-      setPendingUsers((prev) =>
-        prev.map((u) =>
-          u.id === pendingUser.id ? { ...u, status: "approved" as const } : u,
-        ),
-      );
+      await updatePendingUserStatus(pendingUser.id, "approved", pendingUser.userId ?? pendingUser.id);
       toast.success("User approved successfully.");
     } catch {
       toast.error("Failed to approve user.");
+    } finally {
+      setActioningId(null);
     }
   };
 
   const handleReject = async (pendingUser: PendingUser) => {
+    if (actioningId) return;
+    setActioningId(pendingUser.id);
     try {
-      await updatePendingUserStatus(
-        pendingUser.id,
-        "rejected",
-        pendingUser.userId ?? pendingUser.id,
-      );
-      setPendingUsers((prev) =>
-        prev.map((u) =>
-          u.id === pendingUser.id ? { ...u, status: "rejected" as const } : u,
-        ),
-      );
-      toast.error("User application rejected.");
+      await updatePendingUserStatus(pendingUser.id, "rejected", pendingUser.userId ?? pendingUser.id);
+      toast.message("User application rejected.");
     } catch {
       toast.error("Failed to reject user.");
+    } finally {
+      setActioningId(null);
     }
   };
 
@@ -234,24 +220,26 @@ export default function AdminDashboard() {
                             </div>
                           </div>
 
-                          <div className="flex gap-2 ml-4">
+                          <div className="flex flex-col sm:flex-row gap-2 ml-4 shrink-0">
                             <Button
                               size="sm"
                               variant="outline"
                               className="text-green-600 border-green-600 hover:bg-green-50"
+                              disabled={!!actioningId}
                               onClick={() => handleApprove(user)}
                             >
                               <Check className="w-4 h-4 mr-1" />
-                              Approve
+                              {actioningId === user.id ? "Approving…" : "Approve"}
                             </Button>
                             <Button
                               size="sm"
                               variant="outline"
                               className="text-red-600 border-red-600 hover:bg-red-50"
+                              disabled={!!actioningId}
                               onClick={() => handleReject(user)}
                             >
                               <X className="w-4 h-4 mr-1" />
-                              Reject
+                              {actioningId === user.id ? "Rejecting…" : "Reject"}
                             </Button>
                           </div>
                         </div>

@@ -97,16 +97,59 @@ export async function getDocumentsForUser(userId: string): Promise<Document[]> {
   return Array.from(map.values()).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
 }
 
+// Real-time version of getDocumentsForUser — runs two parallel listeners and merges results
+export function subscribeToDocumentsForUser(
+  userId: string,
+  onChange: (docs: Document[]) => void,
+): () => void {
+  const dbRef = getDbOrThrow();
+  const ownedQ = query(collection(dbRef, DOCUMENTS), where("ownerId", "==", userId));
+  const collabQ = query(collection(dbRef, DOCUMENTS), where("collaboratorIds", "array-contains", userId));
+
+  // Merge results from both listeners into a single deduplicated sorted list
+  const ownedMap = new Map<string, Document>();
+  const collabMap = new Map<string, Document>();
+
+  function emit() {
+    const merged = new Map<string, Document>();
+    ownedMap.forEach((v, k) => merged.set(k, v));
+    collabMap.forEach((v, k) => merged.set(k, v));
+    const sorted = Array.from(merged.values()).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    onChange(sorted);
+  }
+
+  const unsubOwned = onSnapshot(ownedQ, (snap) => {
+    snap.docs.forEach((d) => ownedMap.set(d.id, { ...(d.data() as Omit<Document, "id">), id: d.id }));
+    snap.docChanges().forEach((change) => { if (change.type === "removed") ownedMap.delete(change.doc.id); });
+    emit();
+  });
+
+  const unsubCollab = onSnapshot(collabQ, (snap) => {
+    snap.docs.forEach((d) => collabMap.set(d.id, { ...(d.data() as Omit<Document, "id">), id: d.id }));
+    snap.docChanges().forEach((change) => { if (change.type === "removed") collabMap.delete(change.doc.id); });
+    emit();
+  });
+
+  return () => { unsubOwned(); unsubCollab(); };
+}
+
 export async function getDiscoverDocuments(): Promise<Document[]> {
   const dbRef = getDbOrThrow();
-  const q = query(
-    collection(dbRef, DOCUMENTS),
-    where("stage", "==", "published"),
-  );
+  const q = query(collection(dbRef, DOCUMENTS), where("stage", "==", "published"));
   const snap = await getDocs(q);
   return snap.docs
     .map((d) => ({ ...(d.data() as Omit<Document, "id">), id: d.id }))
-    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    .sort((a, b) => (b.publishedAt ?? b.updatedAt).localeCompare(a.publishedAt ?? a.updatedAt));
+}
+
+export function subscribeToDiscoverDocuments(onChange: (docs: Document[]) => void): () => void {
+  const q = query(collection(getDbOrThrow(), DOCUMENTS), where("stage", "==", "published"));
+  return onSnapshot(q, (snap) => {
+    const docs = snap.docs
+      .map((d) => ({ ...(d.data() as Omit<Document, "id">), id: d.id }))
+      .sort((a, b) => (b.publishedAt ?? b.updatedAt).localeCompare(a.publishedAt ?? a.updatedAt));
+    onChange(docs);
+  });
 }
 
 export async function getDocumentById(id: string): Promise<Document | null> {
@@ -156,14 +199,24 @@ export async function deleteDocumentById(id: string) {
 
 export async function getPendingUsers(universityName: string): Promise<PendingUser[]> {
   const dbRef = getDbOrThrow();
-  const q = query(
-    collection(dbRef, PENDING_USERS),
-    where("university", "==", universityName),
-  );
+  const q = query(collection(dbRef, PENDING_USERS), where("university", "==", universityName));
   const snap = await getDocs(q);
   return snap.docs
     .map((d) => ({ ...(d.data() as Omit<PendingUser, "id">), id: d.id }))
     .sort((a, b) => b.submittedAt.localeCompare(a.submittedAt));
+}
+
+export function subscribeToPendingUsers(
+  universityName: string,
+  onChange: (users: PendingUser[]) => void,
+): () => void {
+  const q = query(collection(getDbOrThrow(), PENDING_USERS), where("university", "==", universityName));
+  return onSnapshot(q, (snap) => {
+    const users = snap.docs
+      .map((d) => ({ ...(d.data() as Omit<PendingUser, "id">), id: d.id }))
+      .sort((a, b) => b.submittedAt.localeCompare(a.submittedAt));
+    onChange(users);
+  });
 }
 
 export async function createPendingUser(
@@ -296,5 +349,19 @@ export async function getBranchDocumentsForParent(parentDocumentId: string): Pro
   const snap = await getDocs(q);
   return snap.docs
     .map((d) => ({ ...(d.data() as Omit<Document, "id">), id: d.id }))
-    .sort((a, b) => (b.mergeRequestCreatedAt ?? b.updatedAt).localeCompare(a.mergeRequestCreatedAt ?? a.updatedAt));
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+}
+
+// Real-time subscription for branch documents so parent owner sees incoming merge requests instantly
+export function subscribeToBranchDocuments(
+  parentDocumentId: string,
+  onChange: (branches: Document[]) => void,
+): () => void {
+  const q = query(collection(getDbOrThrow(), DOCUMENTS), where("parentDocumentId", "==", parentDocumentId));
+  return onSnapshot(q, (snap) => {
+    const branches = snap.docs
+      .map((d) => ({ ...(d.data() as Omit<Document, "id">), id: d.id }))
+      .sort((a, b) => (b.mergeRequestCreatedAt ?? b.updatedAt).localeCompare(a.mergeRequestCreatedAt ?? a.updatedAt));
+    onChange(branches);
+  });
 }
