@@ -569,17 +569,16 @@ function applyLocalPrompt(prompt: string, selectedText: string) {
 
 function buildDraftDocument(user: User): Document {
   const now = new Date().toISOString();
-  const starterContent = "<h1>Untitled Research Paper</h1><p>Start writing your research here...</p>";
   return {
     id: `doc-new-${Date.now()}`,
     title: "Untitled Research Paper",
-    content: starterContent,
+    content: "<h1>Untitled Research Paper</h1><p>Start writing your research here...</p>",
     imageUrls: [],
     ownerId: user.id,
     ownerName: user.name,
     collaborators: [{ id: user.id, name: user.name, email: user.email, role: "owner", joinedAt: now }],
-    versions: [{ id: "v1", version: 1, content: starterContent, author: user.name, authorId: user.id, timestamp: now, message: "Initial commit", changes: [] }],
-    currentVersion: 1,
+    versions: [],
+    currentVersion: 0,
     field: "General",
     topic: "Research",
     stage: "draft",
@@ -869,7 +868,7 @@ export default function DocumentEditorPage() {
 
   // Presence: write on mount, subscribe to others, clean up on unmount
   useEffect(() => {
-    if (!user || !document || isNewDocument) return;
+    if (!user || !document || isNewDocument || isDiscoverReadOnlyView) return;
     const docId = document.id;
     const color = presenceColor(user.id);
     void upsertDocumentPresence(docId, user.id, {
@@ -878,11 +877,19 @@ export default function DocumentEditorPage() {
       cursorFrom: null,
       lastSeen: new Date().toISOString(),
     });
-    const unsubscribe = subscribeToDocumentPresence(docId, (all) => {
-      const others = all.filter((p) => p.userId !== user.id);
-      setOtherPresence(others);
-      otherPresenceRef.current = others;
-    });
+    const unsubscribe = subscribeToDocumentPresence(
+      docId,
+      (all) => {
+        const others = all.filter((p) => p.userId !== user.id);
+        setOtherPresence(others);
+        otherPresenceRef.current = others;
+      },
+      () => {
+        // Permission denied — silently clear presence rather than crashing the listener
+        setOtherPresence([]);
+        otherPresenceRef.current = [];
+      },
+    );
     const handleUnload = () => void removeDocumentPresence(docId, user.id);
     window.addEventListener("beforeunload", handleUnload);
     return () => {
@@ -891,7 +898,7 @@ export default function DocumentEditorPage() {
       window.removeEventListener("beforeunload", handleUnload);
     };
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [user?.id, document?.id, isNewDocument]);
+  }, [user?.id, document?.id, isNewDocument, isDiscoverReadOnlyView]);
 
   // Presence: re-render cursor decorations when other users' presence changes
   useEffect(() => {
@@ -901,7 +908,7 @@ export default function DocumentEditorPage() {
 
   // Presence: track current user's cursor position (throttled to 500 ms)
   useEffect(() => {
-    if (!editor || !user || !document || isNewDocument) return;
+    if (!editor || !user || !document || isNewDocument || isDiscoverReadOnlyView) return;
     const docId = document.id;
     const color = presenceColor(user.id);
     const handleSelection = () => {
@@ -1196,6 +1203,9 @@ export default function DocumentEditorPage() {
             title: effectiveTitle,
             content: liveContent,
             imageUrls: liveImageUrls,
+            // Never persist pre-populated draft versions on auto-save — user explicitly saves versions
+            versions: [],
+            currentVersion: 0,
             updatedAt: now,
             createdAt: document.createdAt || now,
           };
@@ -1691,14 +1701,23 @@ export default function DocumentEditorPage() {
         imageUrls: liveImageUrls,
         ownerId: user.id,
         ownerName: user.name,
-        versions: [...document.versions, { id: `v${document.versions.length + 1}`, version: document.versions.length + 1, content: liveContent, author: user.name, authorId: user.id, timestamp: now, message: `Created branch: ${label}`, changes: [] }],
-        currentVersion: document.versions.length + 1,
+        versions: [{ id: "v1", version: 1, content: liveContent, author: user.name, authorId: user.id, timestamp: now, message: `Created branch: ${label}`, changes: [] }],
+        currentVersion: 1,
+        stage: "draft",
         createdAt: now,
         updatedAt: now,
-        // Track parent for merge
+        // Branch tracking — explicitly set, overriding any spread values
         parentDocumentId: document.id,
         branchLabel: label,
         branchAncestorContent: liveContent,
+        // Clear merge fields from spread so the new branch starts clean
+        mergeRequestStatus: undefined,
+        mergeRequestMessage: undefined,
+        mergeRequestCreatedAt: undefined,
+        mergeRequestAuthorId: undefined,
+        mergeRequestAuthorName: undefined,
+        mergeRequestResolvedAt: undefined,
+        mergeRequestResolvedBy: undefined,
         collaboratorIds: branchCollaboratorIds,
       };
       const createdId = await createDocument(payload);
@@ -2058,37 +2077,87 @@ export default function DocumentEditorPage() {
   return (
     <div className="min-h-screen bg-gray-50">
       <header className="sticky top-0 z-10 border-b bg-white">
-        <div className="mx-auto flex h-16 max-w-7xl items-center justify-between px-4 sm:px-6 lg:px-8">
-          <div className="flex items-center gap-4">
-            <Button variant="ghost" size="sm" onClick={() => router.push("/dashboard")}><ArrowLeft className="mr-2 h-4 w-4" />Back</Button>
-            <div>
-              <Input value={effectiveTitle} onChange={(e) => setTitleDraft(e.target.value)} className="border-0 px-0 text-lg font-semibold focus-visible:ring-0" disabled={!canEdit} />
-              <p className="text-xs text-gray-500">{stripHtml(effectiveContent).split(/\s+/).filter(Boolean).length} words</p>
+        <div className="mx-auto flex h-16 max-w-7xl items-center justify-between gap-2 px-4 sm:px-6 lg:px-8">
+          {/* Left: back + title */}
+          <div className="flex min-w-0 flex-1 items-center gap-2">
+            <Button variant="ghost" size="sm" className="shrink-0" onClick={() => router.push("/dashboard")}>
+              <ArrowLeft className="h-4 w-4" />
+              <span className="ml-1 hidden sm:inline">Back</span>
+            </Button>
+            <div className="min-w-0">
+              <Input
+                value={effectiveTitle}
+                onChange={(e) => setTitleDraft(e.target.value)}
+                className="h-auto truncate border-0 px-0 text-base font-semibold focus-visible:ring-0 sm:text-lg"
+                disabled={!canEdit}
+              />
+              <p className="hidden text-xs text-gray-500 sm:block">
+                {stripHtml(effectiveContent).split(/\s+/).filter(Boolean).length} words
+              </p>
             </div>
           </div>
-          <div className="flex items-center gap-2">
+
+          {/* Right: presence + status + actions */}
+          <div className="flex shrink-0 items-center gap-1.5">
+            {/* Collaborator presence avatars */}
             {otherPresence.length > 0 && (
-              <div className="flex items-center gap-1" title={otherPresence.map((p) => p.userName).join(", ") + " online"}>
-                {otherPresence.slice(0, 5).map((p) => (
-                  <div key={p.userId} title={`${p.userName} is viewing`} className="relative flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-[10px] font-semibold text-white ring-2 ring-white" style={{ backgroundColor: p.color }}>
+              <div className="flex items-center gap-0.5" title={otherPresence.map((p) => p.userName).join(", ") + " online"}>
+                {otherPresence.slice(0, 3).map((p) => (
+                  <div
+                    key={p.userId}
+                    title={`${p.userName} is viewing`}
+                    className="relative flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-[10px] font-semibold text-white ring-2 ring-white"
+                    style={{ backgroundColor: p.color }}
+                  >
                     {p.userName.split(" ").map((n) => n[0]).join("").slice(0, 2).toUpperCase()}
                     <span className="absolute -bottom-0.5 -right-0.5 h-2.5 w-2.5 rounded-full border-2 border-white bg-green-500" />
                   </div>
                 ))}
-                {otherPresence.length > 5 && (
-                  <span className="text-xs text-gray-500">+{otherPresence.length - 5}</span>
+                {otherPresence.length > 3 && (
+                  <span className="text-xs text-gray-500">+{otherPresence.length - 3}</span>
                 )}
               </div>
             )}
-            <Badge variant="outline">v{document.currentVersion}</Badge>
-            {isDiscoverReadOnlyView && <Badge className="bg-green-100 text-green-800">Published read-only</Badge>}
-            {hasChanges && <Badge className="bg-amber-100 text-amber-800">Unsaved changes</Badge>}
-            {autoSaving && <Badge className="bg-blue-100 text-blue-800">Auto-saving...</Badge>}
-            <Button variant="outline" size="sm" onClick={() => imageInputRef.current?.click()} disabled={!canEdit || imageUploading}><ImagePlus className="mr-2 h-4 w-4" />Image</Button>
+
+            {/* Status badges — hide less-critical ones on mobile */}
+            <Badge variant="outline" className="hidden sm:inline-flex">
+              {document.currentVersion > 0 ? `v${document.currentVersion}` : "draft"}
+            </Badge>
+            {isDiscoverReadOnlyView && <Badge className="hidden bg-green-100 text-green-800 sm:inline-flex">Read-only</Badge>}
+            {hasChanges && !autoSaving && <Badge className="bg-amber-100 text-amber-800">Unsaved</Badge>}
+            {autoSaving && <Badge className="bg-blue-100 text-blue-800">Saving…</Badge>}
+
+            {/* Action buttons — image + AI hidden on xs, shown on sm+ */}
+            <Button
+              variant="outline"
+              size="sm"
+              className="hidden sm:inline-flex"
+              onClick={() => imageInputRef.current?.click()}
+              disabled={!canEdit || imageUploading}
+            >
+              <ImagePlus className="h-4 w-4" />
+              <span className="ml-1.5 hidden lg:inline">Image</span>
+            </Button>
             <input ref={imageInputRef} type="file" accept="image/*" className="hidden" onChange={handleImageUpload} />
-            <Button variant="outline" size="sm" onClick={handleOpenAiDialog} disabled={!canEdit}><Sparkles className="mr-2 h-4 w-4" />AI</Button>
-            <Button size="sm" onClick={() => { setCommitMessage(""); setCommitOpen(true); }} disabled={!canEdit || !hasChanges}>
-              <Save className="mr-2 h-4 w-4" />{document.parentDocumentId ? "Save to Branch" : "Save Version"}
+            <Button
+              variant="outline"
+              size="sm"
+              className="hidden sm:inline-flex"
+              onClick={handleOpenAiDialog}
+              disabled={!canEdit}
+            >
+              <Sparkles className="h-4 w-4" />
+              <span className="ml-1.5 hidden lg:inline">AI</span>
+            </Button>
+            <Button
+              size="sm"
+              onClick={() => { setCommitMessage(""); setCommitOpen(true); }}
+              disabled={!canEdit || !hasChanges}
+            >
+              <Save className="h-4 w-4" />
+              <span className="ml-1.5 hidden sm:inline">
+                {document.parentDocumentId ? "Save Branch" : "Save"}
+              </span>
             </Button>
           </div>
         </div>
@@ -2286,6 +2355,11 @@ export default function DocumentEditorPage() {
             </CardHeader>
             <CardContent className="space-y-1 p-3">
               <div className="max-h-72 overflow-y-auto space-y-1 pr-1">
+                {document.versions.length === 0 && (
+                  <p className="py-4 text-center text-xs text-gray-400">
+                    No saved versions yet.{"\n"}Use &quot;Save&quot; to create v1.
+                  </p>
+                )}
                 {document.versions.slice().reverse().map((v) => {
                   const isCurrent = v.version === document.currentVersion && !selectedVersion;
                   const isPreviewing = v.version === selectedVersion;

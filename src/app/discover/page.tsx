@@ -44,6 +44,7 @@ export default function DiscoverPage() {
   const [documents, setDocuments] = useState<Document[]>([]);
   const [loadingData, setLoadingData] = useState(true);
   const chatImageInputRef = useRef<HTMLInputElement | null>(null);
+  const chatEndRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     if (!isLoading && !user) {
@@ -64,6 +65,11 @@ export default function DiscoverPage() {
     }
     loadDocuments();
   }, [user]);
+
+  // Auto-scroll to latest message
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
 
   useEffect(() => {
     if (!user || !db) return;
@@ -179,14 +185,19 @@ export default function DiscoverPage() {
             </div>
 
             <div className="flex items-center gap-2">
-              <Avatar>
-                <AvatarFallback>
-                  {user.name
-                    .split(" ")
-                    .map((n) => n[0])
-                    .join("")}
-                </AvatarFallback>
-              </Avatar>
+              <button
+                type="button"
+                className="flex items-center gap-2 rounded-lg px-2 py-1.5 hover:bg-gray-100 transition-colors"
+                onClick={() => router.push("/profile")}
+                title="View profile"
+              >
+                <Avatar className="h-8 w-8">
+                  <AvatarFallback className="text-sm">
+                    {user.name.split(" ").map((n) => n[0]).join("")}
+                  </AvatarFallback>
+                </Avatar>
+                <span className="hidden sm:block text-sm font-medium text-gray-700">{user.name.split(" ")[0]}</span>
+              </button>
             </div>
           </div>
         </div>
@@ -270,16 +281,16 @@ export default function DiscoverPage() {
                               />
                             </div>
                           )}
-                          <div className="flex justify-between items-start mb-4">
-                            <div className="flex-1">
-                              <h3 className="text-lg font-semibold mb-2">{doc.title}</h3>
-                              <p className="text-sm text-gray-600 mb-3">
+                          <div className="flex flex-col gap-3">
+                            <div>
+                              <h3 className="text-lg font-semibold mb-1">{doc.title}</h3>
+                              <p className="text-sm text-gray-600 mb-2">
                                 by {doc.ownerName} &bull; {doc.university}
                               </p>
                               {doc.abstract && (
                                 <p className="mb-3 text-sm text-gray-700 line-clamp-3">{doc.abstract}</p>
                               )}
-                              <div className="flex flex-wrap gap-2 mb-3">
+                              <div className="flex flex-wrap gap-2 mb-2">
                                 <Badge>{doc.field}</Badge>
                                 <Badge variant="outline">{doc.topic}</Badge>
                                 <Badge
@@ -292,7 +303,7 @@ export default function DiscoverPage() {
                                   {doc.stage.charAt(0).toUpperCase() + doc.stage.slice(1)}
                                 </Badge>
                               </div>
-                              <div className="flex items-center gap-4 text-sm text-gray-600">
+                              <div className="flex flex-wrap items-center gap-3 text-sm text-gray-600">
                                 <div className="flex items-center gap-1">
                                   <Users className="w-4 h-4" />
                                   <span>{doc.collaborators.length} collaborators</span>
@@ -301,18 +312,18 @@ export default function DiscoverPage() {
                                   <span>{doc.readTimeMinutes} min read</span>
                                 )}
                                 <span>
-                                  Published {new Date(doc.publishedAt ?? doc.updatedAt).toLocaleDateString()}
+                                  {new Date(doc.publishedAt ?? doc.updatedAt).toLocaleDateString()}
                                 </span>
                               </div>
                               {Array.isArray(doc.keywords) && doc.keywords.length > 0 && (
-                                <div className="mt-3 flex flex-wrap gap-2">
+                                <div className="mt-2 flex flex-wrap gap-1.5">
                                   {doc.keywords.slice(0, 6).map((keyword) => (
                                     <Badge key={keyword} variant="secondary">{keyword}</Badge>
                                   ))}
                                 </div>
                               )}
                             </div>
-                            <div className="flex flex-col gap-2 ml-4">
+                            <div className="flex flex-wrap gap-2">
                               <Button
                                 size="sm"
                                 onClick={() => router.push(`/document/${doc.id}?view=published&download=1`)}
@@ -350,7 +361,12 @@ export default function DiscoverPage() {
                   </CardDescription>
                 </CardHeader>
                 <CardContent>
-                  <div className="space-y-4 mb-4 max-h-96 overflow-y-auto">
+                  <div className="space-y-4 mb-4 h-80 overflow-y-auto pr-1">
+                    {messages.length === 0 && (
+                      <div className="flex h-full items-center justify-center text-sm text-gray-400">
+                        No messages yet. Start the conversation!
+                      </div>
+                    )}
                     {messages.map((msg) => (
                       <div
                         key={msg.id}
@@ -396,6 +412,7 @@ export default function DiscoverPage() {
                         </div>
                       </div>
                     ))}
+                    <div ref={chatEndRef} />
                   </div>
 
                   <form onSubmit={handleSendMessage} className="flex gap-2">

@@ -3,9 +3,12 @@
 import React, { createContext, useContext, useEffect, useState } from "react";
 import {
   createUserWithEmailAndPassword,
+  EmailAuthProvider,
   onAuthStateChanged,
+  reauthenticateWithCredential,
   signInWithEmailAndPassword,
   signOut,
+  updatePassword as firebaseUpdatePassword,
 } from "firebase/auth";
 import type { RegisterData, User } from "@/lib/types";
 import { auth, firebaseEnvError } from "@/lib/firebase";
@@ -15,6 +18,7 @@ import {
   createUserProfile,
   getUniversities,
   getUserProfile,
+  updateUserProfile,
 } from "@/lib/firestore";
 
 interface AuthContextType {
@@ -23,6 +27,8 @@ interface AuthContextType {
   register: (data: RegisterData) => Promise<void>;
   logout: () => Promise<void>;
   refreshUser: () => Promise<User | null>;
+  changePassword: (currentPassword: string, newPassword: string) => Promise<void>;
+  updateProfile: (fields: { name?: string; program?: string; year?: number; interests?: string[] }) => Promise<void>;
   isAuthenticated: boolean;
   isAdmin: boolean;
   isLoading: boolean;
@@ -165,12 +171,27 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     return profile;
   };
 
+  const changePassword = async (currentPassword: string, newPassword: string) => {
+    if (!auth?.currentUser) throw new Error("Not authenticated.");
+    const credential = EmailAuthProvider.credential(auth.currentUser.email!, currentPassword);
+    await reauthenticateWithCredential(auth.currentUser, credential);
+    await firebaseUpdatePassword(auth.currentUser, newPassword);
+  };
+
+  const updateProfile = async (fields: { name?: string; program?: string; year?: number; interests?: string[] }) => {
+    if (!auth?.currentUser) throw new Error("Not authenticated.");
+    await updateUserProfile(auth.currentUser.uid, fields);
+    setUser((prev) => (prev ? { ...prev, ...fields } : prev));
+  };
+
   const value: AuthContextType = {
     user,
     login,
     register,
     logout,
     refreshUser,
+    changePassword,
+    updateProfile,
     isAuthenticated: !!user,
     isAdmin: user?.role === "admin",
     isLoading,

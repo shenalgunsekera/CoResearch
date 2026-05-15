@@ -60,6 +60,14 @@ export async function saveUserProfile(uid: string, user: Omit<User, "id">) {
   await updateDoc(ref, { ...user });
 }
 
+export async function updateUserProfile(
+  uid: string,
+  fields: { name?: string; program?: string; year?: number; interests?: string[] },
+) {
+  const ref = doc(getDbOrThrow(), USERS, uid);
+  await updateDoc(ref, fields);
+}
+
 export async function createUserProfile(uid: string, user: Omit<User, "id">) {
   const ref = doc(getDbOrThrow(), USERS, uid);
   await import("firebase/firestore").then(({ setDoc }) => setDoc(ref, user));
@@ -270,11 +278,17 @@ export async function removeDocumentPresence(documentId: string, userId: string)
 export function subscribeToDocumentPresence(
   documentId: string,
   onPresence: (presence: DocumentPresence[]) => void,
+  onError?: (error: Error) => void,
 ) {
   const ref = collection(getDbOrThrow(), DOCUMENTS, documentId, DOCUMENT_PRESENCE);
-  return onSnapshot(ref, (snap) => {
-    onPresence(snap.docs.map((d) => d.data() as DocumentPresence));
-  });
+  return onSnapshot(
+    ref,
+    (snap) => { onPresence(snap.docs.map((d) => d.data() as DocumentPresence)); },
+    (error) => {
+      if (onError) onError(error);
+      else console.warn("Presence subscription error:", error.code);
+    },
+  );
 }
 
 export async function getBranchDocumentsForParent(parentDocumentId: string): Promise<Document[]> {

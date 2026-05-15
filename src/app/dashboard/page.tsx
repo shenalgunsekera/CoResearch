@@ -27,6 +27,9 @@ import {
   Trash2,
   Rocket,
   Sparkles,
+  User,
+  Menu,
+  X as XIcon,
 } from "lucide-react";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { toast } from "sonner";
@@ -47,6 +50,7 @@ export default function DashboardPage() {
   const [deleting, setDeleting] = useState(false);
   const [showGuideNudge, setShowGuideNudge] = useState(false);
   const [guideStateReady, setGuideStateReady] = useState(false);
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
   useEffect(() => {
     if (!isLoading && !user) {
@@ -143,59 +147,111 @@ export default function DashboardPage() {
       <header className="bg-white border-b sticky top-0 z-10">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
           <div className="flex justify-between items-center h-16">
-            <div className="flex items-center gap-3">
-              <h1 className="text-2xl font-bold text-gray-900">Co<span className="text-[#5170ff]">Research</span></h1>
-            </div>
+            <h1 className="text-2xl font-bold text-gray-900">Co<span className="text-[#5170ff]">Research</span></h1>
 
-            <div className="flex items-center gap-4">
-              <Button
-                variant="ghost"
-                size="sm"
-                data-tour-id="dashboard-guide"
-                onClick={startProductTour}
-              >
-                <Sparkles className="w-4 h-4 mr-2" />
-                Guide
+            {/* Desktop nav */}
+            <div className="hidden md:flex items-center gap-2">
+              <Button variant="ghost" size="sm" data-tour-id="dashboard-guide" onClick={startProductTour}>
+                <Sparkles className="w-4 h-4 mr-2" />Guide
               </Button>
-              <Button
-                variant="ghost"
-                size="sm"
-                data-tour-id="dashboard-discover"
-                onClick={() => router.push("/discover")}
-              >
-                <Compass className="w-4 h-4 mr-2" />
-                Discover
+              <Button variant="ghost" size="sm" data-tour-id="dashboard-discover" onClick={() => router.push("/discover")}>
+                <Compass className="w-4 h-4 mr-2" />Discover
               </Button>
               {isAdmin && (
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => router.push("/admin")}
-                >
-                  <Settings className="w-4 h-4 mr-2" />
-                  Admin
+                <Button variant="ghost" size="sm" onClick={() => router.push("/admin")}>
+                  <Settings className="w-4 h-4 mr-2" />Admin
                 </Button>
               )}
-              <div className="flex items-center gap-2">
-                <Avatar>
-                  <AvatarFallback>
-                    {user.name
-                      .split(" ")
-                      .map((n) => n[0])
-                      .join("")}
+              <button
+                type="button"
+                className="flex items-center gap-2 rounded-lg px-2 py-1.5 hover:bg-gray-100 transition-colors"
+                onClick={() => router.push("/profile")}
+                title="View profile"
+              >
+                <Avatar className="h-8 w-8">
+                  <AvatarFallback className="text-sm">
+                    {user.name.split(" ").map((n) => n[0]).join("")}
                   </AvatarFallback>
                 </Avatar>
-                <div className="hidden md:block">
-                  <p className="text-sm font-medium text-gray-900">{user.name}</p>
-                  <p className="text-xs text-gray-500">{user.university.name}</p>
+                <div className="text-left">
+                  <p className="text-sm font-medium text-gray-900 leading-none">{user.name}</p>
+                  <p className="text-xs text-gray-500 mt-0.5">{user.university.name}</p>
                 </div>
-              </div>
-              <Button variant="ghost" size="sm" onClick={logout}>
+              </button>
+              <Button variant="ghost" size="sm" onClick={logout} title="Sign out">
                 <LogOut className="w-4 h-4" />
+              </Button>
+            </div>
+
+            {/* Mobile nav */}
+            <div className="flex items-center gap-2 md:hidden">
+              <button
+                type="button"
+                className="flex items-center gap-1.5 rounded-lg px-2 py-1.5 hover:bg-gray-100 transition-colors"
+                onClick={() => router.push("/profile")}
+              >
+                <Avatar className="h-8 w-8">
+                  <AvatarFallback className="text-sm">
+                    {user.name.split(" ").map((n) => n[0]).join("")}
+                  </AvatarFallback>
+                </Avatar>
+              </button>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => setMobileMenuOpen((v) => !v)}
+                aria-label="Toggle menu"
+              >
+                {mobileMenuOpen ? <XIcon className="w-5 h-5" /> : <Menu className="w-5 h-5" />}
               </Button>
             </div>
           </div>
         </div>
+
+        {/* Mobile dropdown */}
+        {mobileMenuOpen && (
+          <div className="md:hidden border-t bg-white px-4 py-3 space-y-1">
+            <button
+              type="button"
+              className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium text-gray-700 hover:bg-gray-100 transition-colors"
+              onClick={() => { setMobileMenuOpen(false); router.push("/profile"); }}
+            >
+              <User className="w-4 h-4" />Profile
+            </button>
+            <button
+              type="button"
+              className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium text-gray-700 hover:bg-gray-100 transition-colors"
+              data-tour-id="dashboard-guide"
+              onClick={() => { setMobileMenuOpen(false); startProductTour(); }}
+            >
+              <Sparkles className="w-4 h-4" />Guide
+            </button>
+            <button
+              type="button"
+              className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium text-gray-700 hover:bg-gray-100 transition-colors"
+              data-tour-id="dashboard-discover"
+              onClick={() => { setMobileMenuOpen(false); router.push("/discover"); }}
+            >
+              <Compass className="w-4 h-4" />Discover
+            </button>
+            {isAdmin && (
+              <button
+                type="button"
+                className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium text-gray-700 hover:bg-gray-100 transition-colors"
+                onClick={() => { setMobileMenuOpen(false); router.push("/admin"); }}
+              >
+                <Settings className="w-4 h-4" />Admin
+              </button>
+            )}
+            <button
+              type="button"
+              className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium text-red-600 hover:bg-red-50 transition-colors"
+              onClick={() => { setMobileMenuOpen(false); logout(); }}
+            >
+              <LogOut className="w-4 h-4" />Sign out
+            </button>
+          </div>
+        )}
       </header>
 
       {/* Main Content */}
