@@ -151,7 +151,7 @@ export default function DashboardPage() {
                 <button
                   type="button"
                   title="Delete project"
-                  className="rounded p-1 text-gray-300 opacity-0 group-hover:opacity-100 hover:bg-red-50 hover:text-red-500 transition-all"
+                  className="rounded p-1 text-gray-400 hover:bg-red-50 hover:text-red-500 transition-colors"
                   onClick={(e) => openDeleteDialog(doc, e)}
                 >
                   <Trash2 className="h-3.5 w-3.5" />
