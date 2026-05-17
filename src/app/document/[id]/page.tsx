@@ -767,6 +767,8 @@ export default function DocumentEditorPage() {
   const [otherPresence, setOtherPresence] = useState<DocumentPresence[]>([]);
   const otherPresenceRef = useRef<DocumentPresence[]>([]);
   const presenceThrottleRef = useRef(0);
+  const mouseThrottleRef = useRef(0);
+  const editorContainerRef = useRef<HTMLDivElement | null>(null);
   const cursorExtension = useMemo(() => buildCursorExtension(otherPresenceRef), []);
 
   const draftDocument = useMemo(() => (isNewDocument && user ? buildDraftDocument(user) : null), [isNewDocument, user]);
@@ -917,7 +919,7 @@ export default function DocumentEditorPage() {
     editor.view.dispatch(editor.state.tr.setMeta(cursorPluginKey, { refresh: true }));
   }, [editor, otherPresence]);
 
-  // Presence: track current user's cursor position (throttled to 500 ms)
+  // Presence: track text cursor position (throttled 500 ms)
   useEffect(() => {
     if (!editor || !user || !document || isNewDocument || isDiscoverReadOnlyView) return;
     const docId = document.id;
@@ -938,6 +940,48 @@ export default function DocumentEditorPage() {
     return () => { editor.off("selectionUpdate", handleSelection); };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [editor, user?.id, document?.id, isNewDocument]);
+
+  // Presence: track mouse position over the editor container (throttled 80 ms)
+  useEffect(() => {
+    if (!user || !document || isNewDocument || isDiscoverReadOnlyView) return;
+    const container = editorContainerRef.current;
+    if (!container) return;
+    const docId = document.id;
+    const color = presenceColor(user.id);
+    const handleMouseMove = (e: MouseEvent) => {
+      const now = Date.now();
+      if (now - mouseThrottleRef.current < 80) return;
+      mouseThrottleRef.current = now;
+      const rect = container.getBoundingClientRect();
+      const mouseX = Math.round(((e.clientX - rect.left) / rect.width) * 100 * 10) / 10;
+      const mouseY = Math.round(((e.clientY - rect.top) / rect.height) * 100 * 10) / 10;
+      void upsertDocumentPresence(docId, user.id, {
+        userName: user.name,
+        color,
+        cursorFrom: null,
+        lastSeen: new Date().toISOString(),
+        mouseX,
+        mouseY,
+      });
+    };
+    const handleMouseLeave = () => {
+      void upsertDocumentPresence(docId, user.id, {
+        userName: user.name,
+        color,
+        cursorFrom: null,
+        lastSeen: new Date().toISOString(),
+        mouseX: null,
+        mouseY: null,
+      });
+    };
+    container.addEventListener("mousemove", handleMouseMove);
+    container.addEventListener("mouseleave", handleMouseLeave);
+    return () => {
+      container.removeEventListener("mousemove", handleMouseMove);
+      container.removeEventListener("mouseleave", handleMouseLeave);
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user?.id, document?.id, isNewDocument, isDiscoverReadOnlyView]);
 
   useEffect(() => {
     editorModeRef.current = editorMode;
@@ -1725,8 +1769,22 @@ export default function DocumentEditorPage() {
       const label = branchName.trim() || "Branch";
       const now = new Date().toISOString();
       const branchCollaboratorIds = Array.from(new Set([...collaborators.map((c) => c.id), user.id]));
+      // Destructure out merge-request fields so they are absent (not undefined) in the new doc
+      const {
+        mergeRequestStatus: _mrs,
+        mergeRequestMessage: _mrm,
+        mergeRequestCreatedAt: _mrca,
+        mergeRequestAuthorId: _mrai,
+        mergeRequestAuthorName: _mran,
+        mergeRequestResolvedAt: _mrra,
+        mergeRequestResolvedBy: _mrrb,
+        parentDocumentId: _pid,
+        branchLabel: _bl,
+        branchAncestorContent: _bac,
+        ...baseDocFields
+      } = document;
       const payload: Omit<Document, "id"> & { collaboratorIds: string[] } = {
-        ...document,
+        ...baseDocFields,
         title: `${effectiveTitle} [${label}]`,
         content: liveContent,
         imageUrls: liveImageUrls,
@@ -1737,18 +1795,9 @@ export default function DocumentEditorPage() {
         stage: "draft",
         createdAt: now,
         updatedAt: now,
-        // Branch tracking — explicitly set, overriding any spread values
         parentDocumentId: document.id,
         branchLabel: label,
         branchAncestorContent: liveContent,
-        // Clear merge fields from spread so the new branch starts clean
-        mergeRequestStatus: undefined,
-        mergeRequestMessage: undefined,
-        mergeRequestCreatedAt: undefined,
-        mergeRequestAuthorId: undefined,
-        mergeRequestAuthorName: undefined,
-        mergeRequestResolvedAt: undefined,
-        mergeRequestResolvedBy: undefined,
         collaboratorIds: branchCollaboratorIds,
       };
       const createdId = await createDocument(payload);
@@ -2358,51 +2407,81 @@ export default function DocumentEditorPage() {
                 </Tabs>
               )}
 
-              {editorMode === "quill" ? (
-                    <div className="report-quill-editor rounded-md border bg-white">
-                  <div ref={quillHostRef} className="min-h-[620px]" />
-                </div>
-              ) : (
-                <>
-                  {editor && (
-                    <BubbleMenu
-                      editor={editor}
-                      updateDelay={0}
-                      shouldShow={({ editor: currentEditor }) => {
-                        const { empty } = currentEditor.state.selection;
-                        return currentEditor.isEditable && !empty;
+              {/* Editor wrapper — ref used for mouse-position tracking */}
+              <div ref={editorContainerRef} className="relative">
+                {/* Floating mouse cursors for other collaborators */}
+                {otherPresence
+                  .filter((p) => p.mouseX != null && p.mouseY != null)
+                  .map((p) => (
+                    <div
+                      key={p.userId}
+                      className="pointer-events-none absolute z-50 select-none"
+                      style={{
+                        left: `${p.mouseX}%`,
+                        top: `${p.mouseY}%`,
+                        transform: "translate(-2px, -2px)",
                       }}
-                      className="flex flex-wrap items-center gap-1 rounded-xl border border-slate-200 bg-white/95 p-1.5 shadow-lg backdrop-blur"
                     >
-                      <Button size="sm" variant={editor.isActive("bold") ? "default" : "outline"} onMouseDown={preventEditorBlur} onClick={() => editor.chain().focus().toggleBold().run()}>
-                        <Bold className="h-4 w-4" />
-                      </Button>
-                      <Button size="sm" variant={editor.isActive("italic") ? "default" : "outline"} onMouseDown={preventEditorBlur} onClick={() => editor.chain().focus().toggleItalic().run()}>
-                        <Italic className="h-4 w-4" />
-                      </Button>
-                      <Button size="sm" variant={editor.isActive("strike") ? "default" : "outline"} onMouseDown={preventEditorBlur} onClick={() => editor.chain().focus().toggleStrike().run()}>
-                        <Strikethrough className="h-4 w-4" />
-                      </Button>
-                      <Button size="sm" variant={editor.isActive("bulletList") ? "default" : "outline"} onMouseDown={preventEditorBlur} onClick={() => editor.chain().focus().toggleBulletList().run()}>
-                        <List className="h-4 w-4" />
-                      </Button>
-                      <Button size="sm" variant={editor.isActive("orderedList") ? "default" : "outline"} onMouseDown={preventEditorBlur} onClick={() => editor.chain().focus().toggleOrderedList().run()}>
-                        <ListOrdered className="h-4 w-4" />
-                      </Button>
-                      <Button size="sm" variant={editor.isActive("blockquote") ? "default" : "outline"} onMouseDown={preventEditorBlur} onClick={() => editor.chain().focus().toggleBlockquote().run()}>
-                        <Quote className="h-4 w-4" />
-                      </Button>
-                      <Button size="sm" variant="outline" onMouseDown={preventEditorBlur} onClick={handleInsertLink}>
-                        <Link2 className="h-4 w-4" />
-                      </Button>
-                      <Button size="sm" variant="outline" onMouseDown={preventEditorBlur} onClick={handleOpenAiDialog}>
-                        <Sparkles className="mr-1 h-4 w-4" />AI
-                      </Button>
-                    </BubbleMenu>
-                  )}
-                  <EditorContent editor={editor} className={`min-h-[620px] rounded-md border bg-white p-4 ${!canEdit ? "prose max-w-none cursor-default" : ""}`} />
-                </>
-              )}
+                      {/* Cursor arrow */}
+                      <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+                        <path d="M0 0 L0 13 L3.5 9.5 L6.5 15 L8 14.5 L5 8.5 L9.5 8.5 Z" fill={p.color} stroke="white" strokeWidth="0.8" />
+                      </svg>
+                      {/* Name label */}
+                      <span
+                        className="absolute left-3 top-0 whitespace-nowrap rounded px-1.5 py-0.5 text-[10px] font-semibold text-white shadow-sm"
+                        style={{ backgroundColor: p.color }}
+                      >
+                        {p.userName.split(" ")[0]}
+                      </span>
+                    </div>
+                  ))}
+
+                {editorMode === "quill" ? (
+                  <div className="report-quill-editor rounded-md border bg-white">
+                    <div ref={quillHostRef} className="min-h-[620px]" />
+                  </div>
+                ) : (
+                  <>
+                    {editor && (
+                      <BubbleMenu
+                        editor={editor}
+                        updateDelay={0}
+                        shouldShow={({ editor: currentEditor }) => {
+                          const { empty } = currentEditor.state.selection;
+                          return currentEditor.isEditable && !empty;
+                        }}
+                        className="flex flex-wrap items-center gap-1 rounded-xl border border-slate-200 bg-white/95 p-1.5 shadow-lg backdrop-blur"
+                      >
+                        <Button size="sm" variant={editor.isActive("bold") ? "default" : "outline"} onMouseDown={preventEditorBlur} onClick={() => editor.chain().focus().toggleBold().run()}>
+                          <Bold className="h-4 w-4" />
+                        </Button>
+                        <Button size="sm" variant={editor.isActive("italic") ? "default" : "outline"} onMouseDown={preventEditorBlur} onClick={() => editor.chain().focus().toggleItalic().run()}>
+                          <Italic className="h-4 w-4" />
+                        </Button>
+                        <Button size="sm" variant={editor.isActive("strike") ? "default" : "outline"} onMouseDown={preventEditorBlur} onClick={() => editor.chain().focus().toggleStrike().run()}>
+                          <Strikethrough className="h-4 w-4" />
+                        </Button>
+                        <Button size="sm" variant={editor.isActive("bulletList") ? "default" : "outline"} onMouseDown={preventEditorBlur} onClick={() => editor.chain().focus().toggleBulletList().run()}>
+                          <List className="h-4 w-4" />
+                        </Button>
+                        <Button size="sm" variant={editor.isActive("orderedList") ? "default" : "outline"} onMouseDown={preventEditorBlur} onClick={() => editor.chain().focus().toggleOrderedList().run()}>
+                          <ListOrdered className="h-4 w-4" />
+                        </Button>
+                        <Button size="sm" variant={editor.isActive("blockquote") ? "default" : "outline"} onMouseDown={preventEditorBlur} onClick={() => editor.chain().focus().toggleBlockquote().run()}>
+                          <Quote className="h-4 w-4" />
+                        </Button>
+                        <Button size="sm" variant="outline" onMouseDown={preventEditorBlur} onClick={handleInsertLink}>
+                          <Link2 className="h-4 w-4" />
+                        </Button>
+                        <Button size="sm" variant="outline" onMouseDown={preventEditorBlur} onClick={handleOpenAiDialog}>
+                          <Sparkles className="mr-1 h-4 w-4" />AI
+                        </Button>
+                      </BubbleMenu>
+                    )}
+                    <EditorContent editor={editor} className={`min-h-[620px] rounded-md border bg-white p-4 ${!canEdit ? "prose max-w-none cursor-default" : ""}`} />
+                  </>
+                )}
+              </div>
             </CardContent>
           </Card>
         </div>

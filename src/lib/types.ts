@@ -141,6 +141,8 @@ export interface DocumentPresence {
   color: string;
   cursorFrom: number | null;
   lastSeen: string;
+  mouseX?: number | null; // percentage 0–100 relative to editor container
+  mouseY?: number | null;
 }
 
 export interface PendingUser {

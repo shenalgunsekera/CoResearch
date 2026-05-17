@@ -4,6 +4,7 @@ import {
   addDoc,
   collection,
   deleteDoc,
+  deleteField,
   doc,
   getDoc,
   getDocs,
@@ -14,6 +15,8 @@ import {
   where,
   orderBy,
 } from "firebase/firestore";
+
+export { deleteField };
 import { db, firebaseEnvError } from "@/lib/firebase";
 import type {
   ChatMessage,
