@@ -4,28 +4,56 @@
       "collectionGroup": "chatMessages",
       "queryScope": "COLLECTION",
       "fields": [
-        {
-          "fieldPath": "university",
-          "order": "ASCENDING"
-        },
-        {
-          "fieldPath": "timestamp",
-          "order": "ASCENDING"
-        }
+        { "fieldPath": "university",  "order": "ASCENDING" },
+        { "fieldPath": "timestamp",   "order": "ASCENDING" }
       ]
     },
     {
       "collectionGroup": "documentComments",
       "queryScope": "COLLECTION",
       "fields": [
-        {
-          "fieldPath": "documentId",
-          "order": "ASCENDING"
-        },
-        {
-          "fieldPath": "timestamp",
-          "order": "ASCENDING"
-        }
+        { "fieldPath": "documentId", "order": "ASCENDING" },
+        { "fieldPath": "timestamp",  "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "documents",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "parentDocumentId", "order": "ASCENDING" },
+        { "fieldPath": "collaboratorIds",  "arrayConfig": "CONTAINS" }
+      ]
+    },
+    {
+      "collectionGroup": "documents",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "ownerId",    "order": "ASCENDING" },
+        { "fieldPath": "updatedAt",  "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "documents",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "collaboratorIds", "arrayConfig": "CONTAINS" },
+        { "fieldPath": "updatedAt",       "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "documents",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "stage",      "order": "ASCENDING" },
+        { "fieldPath": "publishedAt","order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "pendingUsers",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "university",   "order": "ASCENDING" },
+        { "fieldPath": "submittedAt",  "order": "DESCENDING" }
       ]
     }
   ],

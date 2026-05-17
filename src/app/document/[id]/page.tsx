@@ -772,6 +772,12 @@ export default function DocumentEditorPage() {
   const presenceThrottleRef = useRef(0);
   const mouseThrottleRef = useRef(0);
   const editorContainerRef = useRef<HTMLDivElement | null>(null);
+  // Tracks the live parent document content while the user is on a branch
+  const [parentDocument, setParentDocument] = useState<Document | null>(null);
+  const [pullOpen, setPullOpen] = useState(false);
+  const [pullDiffBlocks, setPullDiffBlocks] = useState<MergeBlock[]>([]);
+  const [pullResolutions, setPullResolutions] = useState<Map<number, "parent" | "branch">>(new Map());
+  const [pullApplying, setPullApplying] = useState(false);
   const cursorExtension = useMemo(() => buildCursorExtension(otherPresenceRef), []);
 
   const draftDocument = useMemo(() => (isNewDocument && user ? buildDraftDocument(user) : null), [isNewDocument, user]);
@@ -831,6 +837,11 @@ export default function DocumentEditorPage() {
     !!document && !!user && !isNewDocument &&
     (document.ownerId === user.id ||
      collaborators.find((c) => c.id === user.id)?.canMerge === true);
+  // True when the branch's base is behind the current parent document content
+  const parentOutOfSync =
+    !!document?.parentDocumentId &&
+    !!parentDocument &&
+    parentDocument.content !== (document?.branchAncestorContent ?? "");
   const canComment = !!document && !!user && !isNewDocument && !isDiscoverReadOnlyView;
   const canViewDocument =
     !!document &&
@@ -1223,19 +1234,25 @@ export default function DocumentEditorPage() {
       },
     );
 
-    // Load parent title if on a branch (one-time is fine — title rarely changes)
-    async function loadParentTitle() {
+    // Load parent title and subscribe to parent content changes (for out-of-sync detection on branches)
+    let unsubParent: (() => void) | null = null;
+    async function loadParentInfo() {
       try {
         const loadedDoc = await getDocumentById(id);
         if (loadedDoc?.parentDocumentId) {
-          const parentDoc = await getDocumentById(loadedDoc.parentDocumentId);
-          if (parentDoc) setParentDocTitle(parentDoc.title);
+          setParentDocTitle((await getDocumentById(loadedDoc.parentDocumentId))?.title ?? null);
+          // Real-time subscription so we detect when the owner updates the main doc
+          unsubParent = subscribeToDocumentById(
+            loadedDoc.parentDocumentId,
+            (parentDoc) => { if (parentDoc) setParentDocument(parentDoc); },
+            () => { /* silently ignore parent read errors */ },
+          );
         }
       } catch {
         // Silently ignore
       }
     }
-    void loadParentTitle();
+    void loadParentInfo();
 
     // Subscribe to branch documents in real time — parent owner sees new merge requests instantly
     let unsubBranches: (() => void) | null = null;
@@ -1250,6 +1267,7 @@ export default function DocumentEditorPage() {
     return () => {
       unsubscribe();
       unsubBranches?.();
+      unsubParent?.();
     };
   }, [editor, id, isLoading, isNewDocument, router, user]);
 
@@ -1998,6 +2016,47 @@ export default function DocumentEditorPage() {
   };
 
   // Parent doc owner rejects the merge request
+  // Apply pulled parent changes to the branch (auto or after conflict resolution)
+  const applyPull = async (mergedContent: string) => {
+    if (!document || !user || !parentDocument) return;
+    setPullApplying(true);
+    try {
+      editor?.commands.setContent(mergedContent, { emitUpdate: false });
+      setEditorHtml(mergedContent);
+      await updateDocument(document.id, {
+        content: mergedContent,
+        branchAncestorContent: parentDocument.content,
+        updatedAt: new Date().toISOString(),
+      });
+      setPersistedDocument((prev) =>
+        prev ? { ...prev, content: mergedContent, branchAncestorContent: parentDocument.content } : prev,
+      );
+      setPullOpen(false);
+      toast.success("Changes from the main document have been pulled into your branch.");
+    } catch (err) {
+      toast.error(`Pull failed: ${getErrorMessage(err)}`);
+    } finally {
+      setPullApplying(false);
+    }
+  };
+
+  // Branch author pulls latest changes from the parent document into the branch
+  const handlePullChanges = () => {
+    if (!document || !parentDocument) return;
+    const ancestor = document.branchAncestorContent ?? "";
+    const blocks = threeWayDiff(ancestor, parentDocument.content, effectiveContent);
+    const hasConflicts = blocks.some((b) => b.status === "conflict");
+    if (hasConflicts) {
+      setPullDiffBlocks(blocks);
+      setPullResolutions(new Map());
+      setPullOpen(true);
+    } else {
+      // No conflicts — auto-merge silently
+      const merged = buildMergedHtml(blocks, new Map());
+      void applyPull(merged);
+    }
+  };
+
   // Branch author withdraws their own pending merge request — unlocks the branch for more editing
   const handleCancelMergeRequest = async () => {
     if (!document?.parentDocumentId || !user) return;
@@ -2366,21 +2425,26 @@ export default function DocumentEditorPage() {
       {/* Branch status banner — changes colour and message based on merge request state */}
       {document.parentDocumentId && (() => {
         const mrs = document.mergeRequestStatus;
-        const isPending  = mrs === "pending";
-        const isRejected = mrs === "rejected";
-        const justMerged = !mrs && !!document.lastMergedAt;
-        const bannerCls = isPending  ? "border-b bg-blue-50 text-blue-800"
-                        : isRejected ? "border-b bg-red-50 text-red-800"
-                        : justMerged ? "border-b bg-green-50 text-green-800"
-                                     : "border-b bg-amber-50 text-amber-800";
-        const iconEl = isPending  ? <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
-                     : isRejected ? <X className="h-3.5 w-3.5 shrink-0" />
-                     : justMerged ? <Check className="h-3.5 w-3.5 shrink-0" />
-                                  : <GitBranch className="h-3.5 w-3.5 shrink-0" />;
+        const isPending   = mrs === "pending";
+        const isRejected  = mrs === "rejected";
+        const justMerged  = !mrs && !!document.lastMergedAt;
+        const outOfSync   = parentOutOfSync && !isPending;
+        const bannerCls = isPending   ? "border-b bg-blue-50 text-blue-800"
+                        : isRejected  ? "border-b bg-red-50 text-red-800"
+                        : outOfSync   ? "border-b bg-orange-50 text-orange-800"
+                        : justMerged  ? "border-b bg-green-50 text-green-800"
+                                      : "border-b bg-amber-50 text-amber-800";
+        const iconEl = isPending   ? <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+                     : isRejected  ? <X className="h-3.5 w-3.5 shrink-0" />
+                     : outOfSync   ? <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+                     : justMerged  ? <Check className="h-3.5 w-3.5 shrink-0" />
+                                   : <GitBranch className="h-3.5 w-3.5 shrink-0" />;
         const message = isPending
           ? "Merge request pending — editing is locked. Cancel the request (in the sidebar) to keep editing."
           : isRejected
           ? `Rejected by ${document.mergeRequestResolvedBy ?? "the owner"}. Update your changes and resubmit.`
+          : outOfSync
+          ? "The main document has been updated. Pull the changes before requesting a merge."
           : justMerged
           ? `Last merge accepted on ${new Date(document.lastMergedAt!).toLocaleDateString()} — keep editing and request another merge when ready.`
           : "Changes here are isolated — the original stays unchanged until the owner merges.";
@@ -2397,7 +2461,16 @@ export default function DocumentEditorPage() {
               >
                 {parentDocTitle ?? "original document"}
               </button>
-              <span className="ml-auto text-xs opacity-75">{message}</span>
+              <span className="flex-1 text-xs opacity-75">{message}</span>
+              {outOfSync && (
+                <button
+                  type="button"
+                  onClick={handlePullChanges}
+                  className="shrink-0 rounded-md bg-orange-600 px-2.5 py-1 text-xs font-semibold text-white hover:bg-orange-700 transition-colors"
+                >
+                  Pull Changes
+                </button>
+              )}
             </div>
           </div>
         );
@@ -2925,19 +2998,34 @@ export default function DocumentEditorPage() {
               )}
               {/* Request Merge: shown on branch documents */}
               {document.parentDocumentId && (
-                <Button
-                  size="sm"
-                  variant={document.mergeRequestStatus === "pending" ? "outline" : document.mergeRequestStatus === "rejected" ? "destructive" : "default"}
-                  className="w-full justify-start"
-                  disabled={document.mergeRequestStatus === "pending"}
-                  onClick={() => { setMergeRequestMsg(""); setMergeRequestOpen(true); }}
-                >
-                  <GitMerge className="mr-2 h-4 w-4 shrink-0" />
-                  {document.mergeRequestStatus === "pending"  ? "Request Pending (Cancel to edit)" :
-                   document.mergeRequestStatus === "rejected" ? "Resubmit Merge Request" :
-                   document.lastMergedAt                      ? "Request Another Merge" :
-                                                                "Request Merge"}
-                </Button>
+                <>
+                  {parentOutOfSync && !document.mergeRequestStatus && (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="w-full justify-start border-orange-300 text-orange-700 hover:bg-orange-50"
+                      onClick={handlePullChanges}
+                    >
+                      <GitBranch className="mr-2 h-4 w-4 shrink-0" />
+                      Pull Main Doc Changes
+                    </Button>
+                  )}
+                  <Button
+                    size="sm"
+                    variant={document.mergeRequestStatus === "pending" ? "outline" : document.mergeRequestStatus === "rejected" ? "destructive" : "default"}
+                    className="w-full justify-start"
+                    disabled={document.mergeRequestStatus === "pending" || parentOutOfSync}
+                    title={parentOutOfSync ? "Pull the main document's changes first" : undefined}
+                    onClick={() => { setMergeRequestMsg(""); setMergeRequestOpen(true); }}
+                  >
+                    <GitMerge className="mr-2 h-4 w-4 shrink-0" />
+                    {document.mergeRequestStatus === "pending"  ? "Request Pending (Cancel to edit)" :
+                     document.mergeRequestStatus === "rejected" ? "Resubmit Merge Request" :
+                     parentOutOfSync                            ? "Merge Request (pull first)" :
+                     document.lastMergedAt                      ? "Request Another Merge" :
+                                                                  "Request Merge"}
+                  </Button>
+                </>
               )}
               <Button data-tour-id="document-export" variant={isDiscoverReadOnlyView ? "default" : "outline"} size="sm" className="w-full justify-start" onClick={handleExportPdf}><Download className="mr-2 h-4 w-4 shrink-0" />Download PDF</Button>
               {canComment && (
@@ -3041,6 +3129,103 @@ export default function DocumentEditorPage() {
           <DialogFooter>
             <Button variant="outline" onClick={() => setBranchOpen(false)}>Cancel</Button>
             <Button onClick={handleCreateBranch} disabled={branchLoading}>{branchLoading ? "Creating..." : "Create Branch"}</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Pull conflict resolution dialog — shown when pulling parent changes into the branch reveals conflicts */}
+      <Dialog open={pullOpen} onOpenChange={(open) => { if (!pullApplying) setPullOpen(open); }}>
+        <DialogContent className="w-full max-w-2xl">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2"><GitBranch className="h-4 w-4" />Pull Conflicts — Resolve Before Pulling</DialogTitle>
+            <DialogDescription>
+              The main document and your branch both changed the same sections. Choose which version to keep for each conflict. Your branch changes are shown on the right.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="flex flex-wrap gap-3 text-xs">
+            <span className="flex items-center gap-1"><span className="inline-block h-3 w-3 rounded bg-blue-200" />Main document version</span>
+            <span className="flex items-center gap-1"><span className="inline-block h-3 w-3 rounded bg-green-200" />Your branch version</span>
+            <span className="flex items-center gap-1"><span className="inline-block h-3 w-3 rounded bg-yellow-200 border border-yellow-400" />Conflict — choose a version</span>
+          </div>
+          <div className="max-h-96 overflow-y-auto rounded-lg border text-sm font-mono">
+            {pullDiffBlocks.length === 0 && (
+              <p className="p-4 text-center text-gray-500">No conflicts detected.</p>
+            )}
+            {pullDiffBlocks.map((block) => {
+              if (block.status === "unchanged") {
+                return (
+                  <div key={block.idx} className="border-b border-gray-100 bg-white px-3 py-1.5 text-gray-400 text-xs last:border-0">{block.text}</div>
+                );
+              }
+              if (block.status === "parent-only") {
+                return (
+                  <div key={block.idx} className="border-b border-blue-100 bg-blue-50 px-3 py-1.5 last:border-0 flex gap-2">
+                    <span className="shrink-0 font-bold text-blue-600">+</span>
+                    <span className="text-blue-800">{block.text}</span>
+                  </div>
+                );
+              }
+              if (block.status === "branch-add") {
+                return (
+                  <div key={block.idx} className="border-b border-green-100 bg-green-50 px-3 py-1.5 last:border-0 flex gap-2">
+                    <span className="shrink-0 font-bold text-green-600">✓</span>
+                    <span className="text-green-800">{block.text}</span>
+                  </div>
+                );
+              }
+              // conflict
+              const resolution = pullResolutions.get(block.idx);
+              return (
+                <div key={block.idx} className="border-b border-yellow-300 bg-yellow-50 px-3 py-2 last:border-0 space-y-1">
+                  <div className="flex items-center gap-1 text-xs font-semibold text-yellow-700">
+                    <AlertTriangle className="h-3 w-3" />CONFLICT — pick a version:
+                  </div>
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setPullResolutions((prev) => new Map(prev).set(block.idx, "parent"))}
+                      className={`rounded border p-2 text-left text-xs transition-colors ${resolution === "parent" ? "border-blue-400 bg-blue-100 ring-1 ring-blue-400" : "border-gray-200 bg-white hover:bg-gray-50"}`}
+                    >
+                      <div className="mb-1 flex items-center gap-1 font-semibold text-blue-700">
+                        {resolution === "parent" && <Check className="h-3 w-3" />}Use Main Doc
+                      </div>
+                      <span className="text-gray-600">{block.text}</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setPullResolutions((prev) => new Map(prev).set(block.idx, "branch"))}
+                      className={`rounded border p-2 text-left text-xs transition-colors ${resolution === "branch" ? "border-green-400 bg-green-100 ring-1 ring-green-400" : "border-gray-200 bg-white hover:bg-gray-50"}`}
+                    >
+                      <div className="mb-1 flex items-center gap-1 font-semibold text-green-700">
+                        {resolution === "branch" && <Check className="h-3 w-3" />}Keep My Version
+                      </div>
+                      <span className="text-gray-600">{block.branchText}</span>
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          {(() => {
+            const total    = pullDiffBlocks.filter((b) => b.status === "conflict").length;
+            const resolved = pullDiffBlocks.filter((b) => b.status === "conflict" && pullResolutions.has(b.idx)).length;
+            return total > 0 ? (
+              <p className={`text-xs font-medium ${resolved < total ? "text-yellow-600" : "text-green-600"}`}>
+                {resolved < total
+                  ? <><AlertTriangle className="inline h-3 w-3 mr-1" />{total - resolved} conflict(s) still need a decision</>
+                  : <><Check className="inline h-3 w-3 mr-1" />All conflicts resolved — ready to pull</>}
+              </p>
+            ) : null;
+          })()}
+          <DialogFooter className="gap-2">
+            <Button variant="outline" onClick={() => setPullOpen(false)} disabled={pullApplying}>Cancel</Button>
+            <Button
+              onClick={() => void applyPull(buildMergedHtml(pullDiffBlocks, pullResolutions))}
+              disabled={pullApplying || pullDiffBlocks.filter((b) => b.status === "conflict" && !pullResolutions.has(b.idx)).length > 0}
+            >
+              <GitBranch className="mr-1.5 h-4 w-4" />
+              {pullApplying ? "Pulling…" : "Apply Pull"}
+            </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
