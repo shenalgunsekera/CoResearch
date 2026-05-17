@@ -46,13 +46,16 @@ export interface Document {
   branchLabel?: string;
   branchAncestorContent?: string;
   // Merge request — stored on the branch document itself (no separate collection needed)
-  mergeRequestStatus?: "pending" | "merged" | "rejected";
+  // "pending" = waiting for review (branch locked). "rejected" = owner rejected (branch editable).
+  // There is no permanent "merged" state — accepted merges reset the branch for continued use.
+  mergeRequestStatus?: "pending" | "rejected";
   mergeRequestMessage?: string;
   mergeRequestCreatedAt?: string;
   mergeRequestAuthorId?: string;
   mergeRequestAuthorName?: string;
   mergeRequestResolvedAt?: string;
   mergeRequestResolvedBy?: string;
+  lastMergedAt?: string; // Timestamp of the most recent accepted merge
 }
 
 export interface MergeRequest {
@@ -75,6 +78,7 @@ export interface Collaborator {
   email: string;
   role: "owner" | "editor" | "viewer";
   joinedAt: string;
+  canMerge?: boolean; // Owner can grant this to let editors approve/reject merge requests
 }
 
 export interface Version {

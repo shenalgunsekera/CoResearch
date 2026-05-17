@@ -102,7 +102,6 @@ export default function DashboardPage() {
   const getMergeStatusColor = (status: Document["mergeRequestStatus"]) => {
     switch (status) {
       case "pending":  return "bg-amber-100 text-amber-800";
-      case "merged":   return "bg-green-100 text-green-800";
       case "rejected": return "bg-red-100 text-red-700";
       default:         return null;
     }

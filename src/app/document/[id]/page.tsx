@@ -51,6 +51,7 @@ import Link from "@tiptap/extension-link";
 import Image from "@tiptap/extension-image";
 import { TextStyle } from "@tiptap/extension-text-style";
 import Color from "@tiptap/extension-color";
+import TextAlign from "@tiptap/extension-text-align";
 import { toast } from "sonner";
 
 const FONT_PRESETS = [
@@ -714,6 +715,7 @@ export default function DocumentEditorPage() {
   const [selectedFont, setSelectedFont] = useState("Georgia");
   const [selectedFontSize, setSelectedFontSize] = useState("16");
   const [customFont, setCustomFont] = useState("");
+  const [customFontSize, setCustomFontSize] = useState("");
   const [selectedColor, setSelectedColor] = useState("#1f2937");
   const [trackedImageUrls, setTrackedImageUrls] = useState<string[]>([]);
   const [imageEditorOpen, setImageEditorOpen] = useState(false);
@@ -790,10 +792,10 @@ export default function DocumentEditorPage() {
     isPublishedView &&
     document.stage === "published" &&
     (document.publishVisibility ?? "public") === "public";
-  // Branch is locked while its merge request is pending or already merged
+  // Branch is locked only while a merge request is pending review
   const mergeRequestLocked =
     !!document?.parentDocumentId &&
-    (document.mergeRequestStatus === "pending" || document.mergeRequestStatus === "merged");
+    document.mergeRequestStatus === "pending";
   // Published documents are permanently read-only regardless of how they're accessed
   const canEdit =
     !!user &&
@@ -804,6 +806,11 @@ export default function DocumentEditorPage() {
   const canInvite = canManageDocument && !isDiscoverReadOnlyView;
   const canPublish = !!document && canManageDocument && !isNewDocument && !document.parentDocumentId && !isDiscoverReadOnlyView;
   const canCreateBranch = !!document && !document.parentDocumentId && hasEditorRole && !isDiscoverReadOnlyView;
+  // Only the owner can review merges by default; owner can grant canMerge to specific editors
+  const canReviewMerges =
+    !!document && !!user && !isNewDocument &&
+    (document.ownerId === user.id ||
+     collaborators.find((c) => c.id === user.id)?.canMerge === true);
   const canComment = !!document && !!user && !isNewDocument && !isDiscoverReadOnlyView;
   const canViewDocument =
     !!document &&
@@ -854,6 +861,7 @@ export default function DocumentEditorPage() {
       TextStyle,
       TextStyleAttributes,
       Color,
+      TextAlign.configure({ types: ["heading", "paragraph"] }),
       cursorExtension,
     ],
     content: baseContent,
@@ -1213,7 +1221,8 @@ export default function DocumentEditorPage() {
     let unsubBranches: (() => void) | null = null;
     getDocumentById(id).then((loadedDoc) => {
       if (!loadedDoc || loadedDoc.parentDocumentId) return; // Only for parent docs
-      unsubBranches = subscribeToBranchDocuments(loadedDoc.id, (branches) => {
+      if (!user) return;
+      unsubBranches = subscribeToBranchDocuments(loadedDoc.id, user.id, (branches) => {
         setBranchDocs(branches);
       });
     }).catch(() => undefined);
@@ -1420,9 +1429,11 @@ export default function DocumentEditorPage() {
     if (!canEdit) return;
     if (editorMode === "quill") return;
     if (!editor) return;
-    const size = selectedFontSize.trim();
-    if (!/^\d+$/.test(size)) return toast.error("Font size must be a number.");
-    const px = Math.max(8, Math.min(96, parseInt(size, 10)));
+    // Accept both "16" and "16px"
+    const raw = customFontSize.trim() || selectedFontSize.trim();
+    const cleaned = raw.replace(/px$/i, "").trim();
+    if (!/^\d+$/.test(cleaned)) return toast.error("Font size must be a number (e.g. 16).");
+    const px = Math.max(6, Math.min(128, parseInt(cleaned, 10)));
     const isSelectionEmpty = editor.state.selection.empty;
     const command = isSelectionEmpty
       ? editor.chain().focus().selectAll().setMark("textStyle", { fontSize: `${px}px` }).run()
@@ -1432,6 +1443,7 @@ export default function DocumentEditorPage() {
       editor.chain().focus().setTextSelection(editor.state.doc.content.size).run();
     }
     setSelectedFontSize(String(px));
+    setCustomFontSize("");
   };
 
   const handleApplyColor = () => {
@@ -1817,7 +1829,6 @@ export default function DocumentEditorPage() {
   const handleRequestMerge = async () => {
     if (!document?.parentDocumentId || !user) return;
     if (document.mergeRequestStatus === "pending") return toast.info("A merge request is already pending review.");
-    if (document.mergeRequestStatus === "merged") return toast.info("This branch has already been merged.");
     setMergeRequestLoading(true);
     try {
       // Save latest content first so the reviewer always sees the freshest version
@@ -1910,18 +1921,46 @@ export default function DocumentEditorPage() {
         currentVersion: nextVersion.version,
         updatedAt: now,
       });
-      // Mark branch document as merged
+
+      // Reset branch: sync it to the merged content, update the diff baseline,
+      // and clear all merge-request fields so the author can keep working.
+      const branchSyncVersion: Version = {
+        id: `v${activeBranchDoc.versions.length + 1}`,
+        version: activeBranchDoc.versions.length + 1,
+        content: mergedHtml,
+        author: user.name,
+        authorId: user.id,
+        timestamp: now,
+        message: `Synced with parent after merge`,
+        changes: [],
+      };
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       await updateDocument(activeBranchDoc.id, {
-        mergeRequestStatus: "merged",
-        mergeRequestResolvedAt: now,
-        mergeRequestResolvedBy: user.name,
+        content: mergedHtml,
+        branchAncestorContent: mergedHtml,  // new baseline — next diff starts from here
+        versions: [...activeBranchDoc.versions, branchSyncVersion],
+        currentVersion: branchSyncVersion.version,
+        lastMergedAt: now,
+        updatedAt: now,
+        mergeRequestStatus: deleteField() as any,
+        mergeRequestMessage: deleteField() as any,
+        mergeRequestCreatedAt: deleteField() as any,
+        mergeRequestAuthorId: deleteField() as any,
+        mergeRequestAuthorName: deleteField() as any,
+        mergeRequestResolvedAt: deleteField() as any,
+        mergeRequestResolvedBy: deleteField() as any,
       });
+
       editor?.commands.setContent(mergedHtml, { emitUpdate: false });
       setPersistedDocument({ ...document, content: mergedHtml, versions: [...document.versions, nextVersion], currentVersion: nextVersion.version, updatedAt: now });
-      setBranchDocs((prev) => prev.map((b) => b.id === activeBranchDoc.id ? { ...b, mergeRequestStatus: "merged", mergeRequestResolvedAt: now, mergeRequestResolvedBy: user.name } : b));
+      setBranchDocs((prev) => prev.map((b) =>
+        b.id === activeBranchDoc.id
+          ? { ...b, content: mergedHtml, branchAncestorContent: mergedHtml, lastMergedAt: now, mergeRequestStatus: undefined, mergeRequestMessage: undefined, mergeRequestCreatedAt: undefined, mergeRequestAuthorId: undefined, mergeRequestAuthorName: undefined, mergeRequestResolvedAt: undefined, mergeRequestResolvedBy: undefined }
+          : b,
+      ));
       setMergeReviewOpen(false);
       setActiveBranchDoc(null);
-      toast.success("Branch merged successfully.");
+      toast.success("Merged! The branch has been updated and is ready for continued work.");
     } catch (err) {
       toast.error(`Merge failed: ${getErrorMessage(err)}`);
     } finally {
@@ -2266,25 +2305,22 @@ export default function DocumentEditorPage() {
       {document.parentDocumentId && (() => {
         const mrs = document.mergeRequestStatus;
         const isPending  = mrs === "pending";
-        const isMerged   = mrs === "merged";
         const isRejected = mrs === "rejected";
-        const bannerCls = isPending
-          ? "border-b bg-blue-50 text-blue-800"
-          : isMerged
-          ? "border-b bg-green-50 text-green-800"
-          : isRejected
-          ? "border-b bg-red-50 text-red-800"
-          : "border-b bg-amber-50 text-amber-800";
+        const justMerged = !mrs && !!document.lastMergedAt;
+        const bannerCls = isPending  ? "border-b bg-blue-50 text-blue-800"
+                        : isRejected ? "border-b bg-red-50 text-red-800"
+                        : justMerged ? "border-b bg-green-50 text-green-800"
+                                     : "border-b bg-amber-50 text-amber-800";
         const iconEl = isPending  ? <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
-                     : isMerged   ? <Check className="h-3.5 w-3.5 shrink-0" />
                      : isRejected ? <X className="h-3.5 w-3.5 shrink-0" />
+                     : justMerged ? <Check className="h-3.5 w-3.5 shrink-0" />
                                   : <GitBranch className="h-3.5 w-3.5 shrink-0" />;
         const message = isPending
           ? "Merge request pending — editing is locked while the owner reviews your changes."
-          : isMerged
-          ? "This branch has been merged into the original document. No further edits are needed."
           : isRejected
-          ? `Merge request rejected by ${document.mergeRequestResolvedBy ?? "the owner"}. Make your changes and resubmit.`
+          ? `Rejected by ${document.mergeRequestResolvedBy ?? "the owner"}. Update your changes and resubmit.`
+          : justMerged
+          ? `Last merge accepted on ${new Date(document.lastMergedAt!).toLocaleDateString()} — keep editing and request another merge when ready.`
           : "Changes here are isolated — the original stays unchanged until the owner merges.";
         return (
           <div className={`px-4 py-2 sm:px-6 lg:px-8 ${bannerCls}`}>
@@ -2331,12 +2367,17 @@ export default function DocumentEditorPage() {
 
                   <TabsContent value="text" className="mt-3">
                     <div className="space-y-2">
-                      <div className="flex flex-wrap items-center gap-2">
-                      <Button size="sm" variant="outline" onClick={() => editor?.chain().focus().toggleBold().run()}><Bold className="h-4 w-4" /></Button>
-                      <Button size="sm" variant="outline" onClick={() => editor?.chain().focus().toggleItalic().run()}><Italic className="h-4 w-4" /></Button>
-                      <Button size="sm" variant="outline" onClick={() => editor?.chain().focus().toggleStrike().run()}><Strikethrough className="h-4 w-4" /></Button>
-                      <Button size="sm" variant="outline" onClick={() => editor?.chain().focus().toggleCode().run()}><Code2 className="h-4 w-4" /></Button>
-                      <Button size="sm" variant="outline" onClick={() => editor?.chain().focus().unsetAllMarks().clearNodes().run()}>Clear</Button>
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <Button size="sm" variant={editor?.isActive("bold") ? "default" : "outline"} onMouseDown={(e) => e.preventDefault()} onClick={() => editor?.chain().focus().toggleBold().run()}><Bold className="h-4 w-4" /></Button>
+                        <Button size="sm" variant={editor?.isActive("italic") ? "default" : "outline"} onMouseDown={(e) => e.preventDefault()} onClick={() => editor?.chain().focus().toggleItalic().run()}><Italic className="h-4 w-4" /></Button>
+                        <Button size="sm" variant={editor?.isActive("strike") ? "default" : "outline"} onMouseDown={(e) => e.preventDefault()} onClick={() => editor?.chain().focus().toggleStrike().run()}><Strikethrough className="h-4 w-4" /></Button>
+                        <Button size="sm" variant={editor?.isActive("code") ? "default" : "outline"} onMouseDown={(e) => e.preventDefault()} onClick={() => editor?.chain().focus().toggleCode().run()}><Code2 className="h-4 w-4" /></Button>
+                        <div className="mx-1 h-6 w-px bg-gray-200" />
+                        <Button size="sm" variant={editor?.isActive({ textAlign: "left" }) ? "default" : "outline"} onMouseDown={(e) => e.preventDefault()} onClick={() => editor?.chain().focus().setTextAlign("left").run()}><AlignLeft className="h-4 w-4" /></Button>
+                        <Button size="sm" variant={editor?.isActive({ textAlign: "center" }) ? "default" : "outline"} onMouseDown={(e) => e.preventDefault()} onClick={() => editor?.chain().focus().setTextAlign("center").run()}><AlignCenter className="h-4 w-4" /></Button>
+                        <Button size="sm" variant={editor?.isActive({ textAlign: "right" }) ? "default" : "outline"} onMouseDown={(e) => e.preventDefault()} onClick={() => editor?.chain().focus().setTextAlign("right").run()}><AlignRight className="h-4 w-4" /></Button>
+                        <div className="mx-1 h-6 w-px bg-gray-200" />
+                        <Button size="sm" variant="outline" onMouseDown={(e) => e.preventDefault()} onClick={() => editor?.chain().focus().unsetAllMarks().clearNodes().run()}>Clear</Button>
                       </div>
 
                       <div className="grid grid-cols-1 gap-2 lg:grid-cols-3">
@@ -2353,7 +2394,7 @@ export default function DocumentEditorPage() {
                           </div>
                           <div className="flex gap-2">
                             <Input value={customFont} onChange={(e) => setCustomFont(e.target.value)} placeholder="Any font name" className="h-8 min-w-0 flex-1" />
-                            <Button size="sm" variant="outline" onClick={handleApplyFont}>Apply</Button>
+                            <Button size="sm" variant="outline" onMouseDown={(e) => e.preventDefault()} onClick={handleApplyFont}>Apply</Button>
                           </div>
                         </div>
 
@@ -2364,7 +2405,16 @@ export default function DocumentEditorPage() {
                               <SelectTrigger className="h-8 min-w-0 flex-1 border-0 px-1"><SelectValue /></SelectTrigger>
                               <SelectContent>{FONT_SIZE_PRESETS.map((size) => <SelectItem key={size} value={size}>{size}px</SelectItem>)}</SelectContent>
                             </Select>
-                            <Button size="sm" variant="outline" onClick={handleApplyFontSize}>Apply</Button>
+                          </div>
+                          <div className="flex gap-2">
+                            <Input
+                              value={customFontSize}
+                              onChange={(e) => setCustomFontSize(e.target.value)}
+                              onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); handleApplyFontSize(); } }}
+                              placeholder="Custom size e.g. 18"
+                              className="h-8 min-w-0 flex-1"
+                            />
+                            <Button size="sm" variant="outline" onMouseDown={(e) => e.preventDefault()} onClick={handleApplyFontSize}>Apply</Button>
                           </div>
                         </div>
 
@@ -2374,7 +2424,7 @@ export default function DocumentEditorPage() {
                             <Palette className="h-4 w-4 text-gray-500" />
                             <input type="color" value={selectedColor} onChange={(e) => setSelectedColor(e.target.value)} className="h-8 w-10 cursor-pointer rounded border" />
                             <Input value={selectedColor} onChange={(e) => setSelectedColor(e.target.value)} className="h-8 min-w-0 flex-1" />
-                            <Button size="sm" variant="outline" onClick={handleApplyColor}>Apply</Button>
+                            <Button size="sm" variant="outline" onMouseDown={(e) => e.preventDefault()} onClick={handleApplyColor}>Apply</Button>
                           </div>
                         </div>
                       </div>
@@ -2382,22 +2432,23 @@ export default function DocumentEditorPage() {
                   </TabsContent>
 
                   <TabsContent value="structure" className="mt-3">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <Button size="sm" variant="outline" onClick={() => editor?.chain().focus().setParagraph().run()}>Paragraph</Button>
-                      <Button size="sm" variant="outline" onClick={() => editor?.chain().focus().toggleHeading({ level: 1 }).run()}><Heading1 className="h-4 w-4" /></Button>
-                      <Button size="sm" variant="outline" onClick={() => editor?.chain().focus().toggleHeading({ level: 2 }).run()}><Heading2 className="h-4 w-4" /></Button>
-                      <Button size="sm" variant="outline" onClick={() => editor?.chain().focus().toggleHeading({ level: 3 }).run()}><Heading3 className="h-4 w-4" /></Button>
-                      <Button size="sm" variant="outline" onClick={() => editor?.chain().focus().toggleBulletList().run()}><List className="h-4 w-4" /></Button>
-                      <Button size="sm" variant="outline" onClick={() => editor?.chain().focus().toggleOrderedList().run()}><ListOrdered className="h-4 w-4" /></Button>
-                      <Button size="sm" variant="outline" onClick={() => editor?.chain().focus().toggleBlockquote().run()}><Quote className="h-4 w-4" /></Button>
-                      <Button size="sm" variant="outline" onClick={() => editor?.chain().focus().toggleCodeBlock().run()}><Code2 className="h-4 w-4" /></Button>
-                      <Button size="sm" variant="outline" onClick={() => editor?.chain().focus().setHorizontalRule().run()}><Minus className="h-4 w-4" /></Button>
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <Button size="sm" variant={editor?.isActive("paragraph") ? "default" : "outline"} onMouseDown={(e) => e.preventDefault()} onClick={() => editor?.chain().focus().setParagraph().run()}>¶</Button>
+                      <Button size="sm" variant={editor?.isActive("heading", { level: 1 }) ? "default" : "outline"} onMouseDown={(e) => e.preventDefault()} onClick={() => editor?.chain().focus().toggleHeading({ level: 1 }).run()}><Heading1 className="h-4 w-4" /></Button>
+                      <Button size="sm" variant={editor?.isActive("heading", { level: 2 }) ? "default" : "outline"} onMouseDown={(e) => e.preventDefault()} onClick={() => editor?.chain().focus().toggleHeading({ level: 2 }).run()}><Heading2 className="h-4 w-4" /></Button>
+                      <Button size="sm" variant={editor?.isActive("heading", { level: 3 }) ? "default" : "outline"} onMouseDown={(e) => e.preventDefault()} onClick={() => editor?.chain().focus().toggleHeading({ level: 3 }).run()}><Heading3 className="h-4 w-4" /></Button>
+                      <div className="mx-1 h-6 w-px bg-gray-200" />
+                      <Button size="sm" variant={editor?.isActive("bulletList") ? "default" : "outline"} onMouseDown={(e) => e.preventDefault()} onClick={() => editor?.chain().focus().toggleBulletList().run()}><List className="h-4 w-4" /></Button>
+                      <Button size="sm" variant={editor?.isActive("orderedList") ? "default" : "outline"} onMouseDown={(e) => e.preventDefault()} onClick={() => editor?.chain().focus().toggleOrderedList().run()}><ListOrdered className="h-4 w-4" /></Button>
+                      <Button size="sm" variant={editor?.isActive("blockquote") ? "default" : "outline"} onMouseDown={(e) => e.preventDefault()} onClick={() => editor?.chain().focus().toggleBlockquote().run()}><Quote className="h-4 w-4" /></Button>
+                      <Button size="sm" variant={editor?.isActive("codeBlock") ? "default" : "outline"} onMouseDown={(e) => e.preventDefault()} onClick={() => editor?.chain().focus().toggleCodeBlock().run()}><Code2 className="h-4 w-4" /></Button>
+                      <Button size="sm" variant="outline" onMouseDown={(e) => e.preventDefault()} onClick={() => editor?.chain().focus().setHorizontalRule().run()}><Minus className="h-4 w-4" /></Button>
                     </div>
                   </TabsContent>
 
                   <TabsContent value="insert" className="mt-3">
                     <div className="flex flex-wrap items-center gap-2">
-                      <Button size="sm" variant="outline" onClick={handleInsertLink}><Link2 className="mr-2 h-4 w-4" />Link</Button>
+                      <Button size="sm" variant="outline" onMouseDown={(e) => e.preventDefault()} onClick={handleInsertLink}><Link2 className="mr-2 h-4 w-4" />Link</Button>
                       <Button size="sm" variant="outline" onClick={() => imageInputRef.current?.click()}><ImagePlus className="mr-2 h-4 w-4" />Image</Button>
                       <Button size="sm" variant="outline" onClick={handleInsertReportTemplate}><Heading1 className="mr-2 h-4 w-4" />Report Template</Button>
                       <Button size="sm" variant="outline" onClick={handleCreateTableOfContents}><ListOrdered className="mr-2 h-4 w-4" />Generate TOC</Button>
@@ -2480,6 +2531,17 @@ export default function DocumentEditorPage() {
                         <Button size="sm" variant={editor.isActive("blockquote") ? "default" : "outline"} onMouseDown={preventEditorBlur} onClick={() => editor.chain().focus().toggleBlockquote().run()}>
                           <Quote className="h-4 w-4" />
                         </Button>
+                        <div className="mx-0.5 h-5 w-px bg-gray-200" />
+                        <Button size="sm" variant={editor.isActive({ textAlign: "left" }) ? "default" : "outline"} onMouseDown={preventEditorBlur} onClick={() => editor.chain().focus().setTextAlign("left").run()}>
+                          <AlignLeft className="h-4 w-4" />
+                        </Button>
+                        <Button size="sm" variant={editor.isActive({ textAlign: "center" }) ? "default" : "outline"} onMouseDown={preventEditorBlur} onClick={() => editor.chain().focus().setTextAlign("center").run()}>
+                          <AlignCenter className="h-4 w-4" />
+                        </Button>
+                        <Button size="sm" variant={editor.isActive({ textAlign: "right" }) ? "default" : "outline"} onMouseDown={preventEditorBlur} onClick={() => editor.chain().focus().setTextAlign("right").run()}>
+                          <AlignRight className="h-4 w-4" />
+                        </Button>
+                        <div className="mx-0.5 h-5 w-px bg-gray-200" />
                         <Button size="sm" variant="outline" onMouseDown={preventEditorBlur} onClick={handleInsertLink}>
                           <Link2 className="h-4 w-4" />
                         </Button>
@@ -2488,7 +2550,7 @@ export default function DocumentEditorPage() {
                         </Button>
                       </BubbleMenu>
                     )}
-                    <EditorContent editor={editor} className={`min-h-[620px] rounded-md border bg-white p-4 ${!canEdit ? "prose max-w-none cursor-default" : ""}`} />
+                    <EditorContent editor={editor} className={`min-h-[620px] rounded-md border bg-white p-4 ${!canEdit ? "cursor-default" : ""}`} />
                   </>
                 )}
               </div>
@@ -2559,7 +2621,37 @@ export default function DocumentEditorPage() {
               {collaborators.map((collab) => (
                 <div key={collab.id} className="flex items-center gap-2">
                   <Avatar className="h-8 w-8"><AvatarFallback>{collab.name.split(" ").map((n) => n[0]).join("")}</AvatarFallback></Avatar>
-                  <div className="flex-1"><p className="text-sm font-medium">{collab.name}</p><p className="text-xs text-gray-500">{collab.role}</p></div>
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-medium truncate">{collab.name}</p>
+                    <p className="text-xs text-gray-500">{collab.role}</p>
+                  </div>
+                  {/* Owner can grant merge-review permission to editors */}
+                  {canManageDocument && collab.role === "editor" && (
+                    <button
+                      type="button"
+                      title={collab.canMerge ? "Remove merge permission" : "Grant merge permission"}
+                      onClick={async () => {
+                        if (!document) return;
+                        const updated = collaborators.map((c) =>
+                          c.id === collab.id ? { ...c, canMerge: !collab.canMerge } : c,
+                        );
+                        await updateDocument(document.id, { collaborators: updated, updatedAt: new Date().toISOString() });
+                        setPersistedDocument((prev) => prev ? { ...prev, collaborators: updated } : prev);
+                      }}
+                      className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-semibold transition-colors ${
+                        collab.canMerge
+                          ? "bg-blue-100 text-blue-700 hover:bg-blue-200"
+                          : "bg-gray-100 text-gray-400 hover:bg-gray-200"
+                      }`}
+                    >
+                      <GitMerge className="h-3 w-3" />
+                    </button>
+                  )}
+                  {collab.role === "editor" && collab.canMerge && !canManageDocument && (
+                    <span className="shrink-0 rounded bg-blue-100 px-1.5 py-0.5 text-[10px] font-semibold text-blue-700">
+                      can merge
+                    </span>
+                  )}
                 </div>
               ))}
               {canInvite && (
@@ -2578,7 +2670,7 @@ export default function DocumentEditorPage() {
                   {(() => {
                     if (document.parentDocumentId) return null;
                     const pendingCount = branchDocs.filter((b) => b.mergeRequestStatus === "pending").length;
-                    return pendingCount > 0
+                    return pendingCount > 0 && canReviewMerges
                       ? <span className="ml-auto flex h-5 w-5 items-center justify-center rounded-full bg-amber-500 text-[10px] font-bold text-white">{pendingCount}</span>
                       : <span className="ml-auto rounded-full bg-gray-100 px-2 py-0.5 text-xs font-normal text-gray-500">{branchDocs.length}</span>;
                   })()}
@@ -2587,52 +2679,48 @@ export default function DocumentEditorPage() {
               <CardContent className="space-y-2 p-3">
                 {document.parentDocumentId ? (
                   // Branch view — show this branch's own merge request status
-                  document.mergeRequestStatus ? (
-                    <div className={`rounded-lg border p-2.5 text-xs ${
-                      document.mergeRequestStatus === "pending"  ? "border-amber-300 bg-amber-50" :
-                      document.mergeRequestStatus === "merged"   ? "border-green-200 bg-green-50" :
-                      document.mergeRequestStatus === "rejected" ? "border-red-200 bg-red-50" :
-                                                                    "border-gray-200 bg-gray-50"
-                    }`}>
-                      <div className="flex items-center justify-between gap-1">
-                        <span className={`inline-flex items-center gap-0.5 rounded-full px-1.5 py-0.5 text-[10px] font-semibold ${
-                          document.mergeRequestStatus === "pending"  ? "bg-amber-100 text-amber-700" :
-                          document.mergeRequestStatus === "merged"   ? "bg-green-100 text-green-700" :
-                          document.mergeRequestStatus === "rejected" ? "bg-red-100 text-red-700" :
-                                                                        "bg-gray-100 text-gray-500"
-                        }`}>
-                          {document.mergeRequestStatus === "pending"  && <AlertTriangle className="h-2.5 w-2.5" />}
-                          {document.mergeRequestStatus === "merged"   && <Check className="h-2.5 w-2.5" />}
-                          {document.mergeRequestStatus === "rejected" && <X className="h-2.5 w-2.5" />}
-                          {document.mergeRequestStatus.charAt(0).toUpperCase() + document.mergeRequestStatus.slice(1)}
+                  (() => {
+                    const mrs = document.mergeRequestStatus;
+                    if (mrs === "pending") return (
+                      <div className="rounded-lg border border-amber-300 bg-amber-50 p-2.5 text-xs">
+                        <span className="inline-flex items-center gap-0.5 rounded-full bg-amber-100 px-1.5 py-0.5 text-[10px] font-semibold text-amber-700">
+                          <AlertTriangle className="h-2.5 w-2.5" />Pending Review
                         </span>
-                        {document.mergeRequestStatus === "rejected" && (
-                          <button
-                            type="button"
-                            onClick={() => { setMergeRequestMsg(""); setMergeRequestOpen(true); }}
-                            className="rounded bg-red-500 px-2 py-0.5 text-[10px] font-semibold text-white hover:bg-red-600 transition-colors"
-                          >
+                        {document.mergeRequestMessage && <p className="mt-1 italic text-gray-500 line-clamp-2">&quot;{document.mergeRequestMessage}&quot;</p>}
+                        {document.mergeRequestCreatedAt && <p className="mt-1 text-gray-400">Submitted {new Date(document.mergeRequestCreatedAt).toLocaleDateString(undefined, { month: "short", day: "numeric" })}</p>}
+                        <p className="mt-1.5 text-amber-700 font-medium">Editing locked while owner reviews.</p>
+                      </div>
+                    );
+                    if (mrs === "rejected") return (
+                      <div className="rounded-lg border border-red-200 bg-red-50 p-2.5 text-xs">
+                        <div className="flex items-center justify-between gap-1">
+                          <span className="inline-flex items-center gap-0.5 rounded-full bg-red-100 px-1.5 py-0.5 text-[10px] font-semibold text-red-700">
+                            <X className="h-2.5 w-2.5" />Rejected
+                          </span>
+                          <button type="button" onClick={() => { setMergeRequestMsg(""); setMergeRequestOpen(true); }} className="rounded bg-red-500 px-2 py-0.5 text-[10px] font-semibold text-white hover:bg-red-600 transition-colors">
                             Resubmit
                           </button>
-                        )}
+                        </div>
+                        {document.mergeRequestResolvedBy && <p className="mt-1 text-gray-400">Rejected by {document.mergeRequestResolvedBy}</p>}
+                        <p className="mt-1.5 text-red-600 font-medium">Update your changes and resubmit.</p>
                       </div>
-                      {document.mergeRequestMessage && <p className="mt-1 italic text-gray-500 line-clamp-2">&quot;{document.mergeRequestMessage}&quot;</p>}
-                      {document.mergeRequestCreatedAt && <p className="mt-1 text-gray-400">Submitted {new Date(document.mergeRequestCreatedAt).toLocaleDateString(undefined, { month: "short", day: "numeric" })}</p>}
-                      {document.mergeRequestResolvedBy && (
-                        <p className="mt-0.5 text-gray-400">
-                          {document.mergeRequestStatus === "merged" ? "Merged" : "Rejected"} by {document.mergeRequestResolvedBy}
-                        </p>
-                      )}
-                      {document.mergeRequestStatus === "rejected" && (
-                        <p className="mt-1.5 text-red-600 font-medium">Make your changes above and resubmit.</p>
-                      )}
-                    </div>
-                  ) : (
-                    <div className="flex flex-col items-center gap-1.5 rounded-lg border border-dashed border-gray-200 py-5 text-center">
-                      <GitBranch className="h-6 w-6 text-gray-300" />
-                      <p className="text-xs text-gray-400">No merge request yet.{"\n"}Use &quot;Request Merge&quot; in Actions.</p>
-                    </div>
-                  )
+                    );
+                    if (document.lastMergedAt) return (
+                      <div className="rounded-lg border border-green-200 bg-green-50 p-2.5 text-xs">
+                        <span className="inline-flex items-center gap-0.5 rounded-full bg-green-100 px-1.5 py-0.5 text-[10px] font-semibold text-green-700">
+                          <Check className="h-2.5 w-2.5" />Last Merge Accepted
+                        </span>
+                        <p className="mt-1 text-gray-500">{new Date(document.lastMergedAt).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })}</p>
+                        <p className="mt-1.5 text-green-700 font-medium">Keep editing — request another merge when ready.</p>
+                      </div>
+                    );
+                    return (
+                      <div className="flex flex-col items-center gap-1.5 rounded-lg border border-dashed border-gray-200 py-5 text-center">
+                        <GitBranch className="h-6 w-6 text-gray-300" />
+                        <p className="text-xs text-gray-400">No merge request yet.{"\n"}Use &quot;Request Merge&quot; in Actions.</p>
+                      </div>
+                    );
+                  })()
                 ) : (
                   // Parent view — show all branch documents
                   branchDocs.length === 0 ? (
@@ -2644,32 +2732,37 @@ export default function DocumentEditorPage() {
                     <div className="space-y-2">
                       {branchDocs.map((b) => {
                         const status = b.mergeRequestStatus;
-                        const isPending = status === "pending";
-                        const isMerged  = status === "merged";
+                        const isPending  = status === "pending";
+                        const isRejected = status === "rejected";
+                        const wasMerged  = !status && !!b.lastMergedAt;
                         return (
                           <div key={b.id} className={`rounded-lg border p-2.5 text-xs ${
-                            isPending ? "border-amber-300 bg-amber-50" :
-                            isMerged  ? "border-green-200 bg-green-50" :
-                                        "border-gray-200 bg-gray-50"
+                            isPending  ? "border-amber-300 bg-amber-50" :
+                            wasMerged  ? "border-green-200 bg-green-50" :
+                            isRejected ? "border-red-200 bg-red-50" :
+                                         "border-gray-200 bg-gray-50"
                           }`}>
                             <div className="flex items-start justify-between gap-1">
                               {status ? (
                                 <span className={`inline-flex items-center gap-0.5 rounded-full px-1.5 py-0.5 text-[10px] font-semibold ${
-                                  isPending ? "bg-amber-100 text-amber-700" :
-                                  isMerged  ? "bg-green-100 text-green-700" :
-                                              "bg-gray-100 text-gray-500"
+                                  isPending  ? "bg-amber-100 text-amber-700" :
+                                  isRejected ? "bg-red-100 text-red-700" :
+                                               "bg-gray-100 text-gray-500"
                                 }`}>
-                                  {isPending && <AlertTriangle className="h-2.5 w-2.5" />}
-                                  {isMerged  && <Check className="h-2.5 w-2.5" />}
-                                  {status === "rejected" && <X className="h-2.5 w-2.5" />}
+                                  {isPending  && <AlertTriangle className="h-2.5 w-2.5" />}
+                                  {isRejected && <X className="h-2.5 w-2.5" />}
                                   {status.charAt(0).toUpperCase() + status.slice(1)}
+                                </span>
+                              ) : wasMerged ? (
+                                <span className="inline-flex items-center gap-0.5 rounded-full bg-green-100 px-1.5 py-0.5 text-[10px] font-semibold text-green-700">
+                                  <Check className="h-2.5 w-2.5" />Last merged {new Date(b.lastMergedAt!).toLocaleDateString(undefined, { month: "short", day: "numeric" })}
                                 </span>
                               ) : (
                                 <span className="inline-flex items-center gap-0.5 rounded-full bg-gray-100 px-1.5 py-0.5 text-[10px] font-semibold text-gray-500">
-                                  <GitBranch className="h-2.5 w-2.5" />Branch
+                                  <GitBranch className="h-2.5 w-2.5" />Active branch
                                 </span>
                               )}
-                              {isPending && (
+                              {isPending && canReviewMerges && (
                                 <button
                                   type="button"
                                   onClick={() => handleOpenMergeReview(b)}
@@ -2678,6 +2771,11 @@ export default function DocumentEditorPage() {
                                   Review
                                 </button>
                               )}
+                              {isPending && !canReviewMerges && (
+                                <span className="rounded bg-gray-100 px-2 py-0.5 text-[10px] font-semibold text-gray-500">
+                                  Awaiting owner
+                                </span>
+                              )}
                             </div>
                             <p className="mt-1.5 font-medium text-gray-700 truncate">{b.branchLabel ?? b.title}</p>
                             {b.mergeRequestMessage && <p className="mt-0.5 italic text-gray-500 line-clamp-2">&quot;{b.mergeRequestMessage}&quot;</p>}
@@ -2685,7 +2783,7 @@ export default function DocumentEditorPage() {
                               <span>{b.mergeRequestAuthorName ?? b.ownerName}</span>
                               {b.mergeRequestCreatedAt && <span>{new Date(b.mergeRequestCreatedAt).toLocaleDateString(undefined, { month: "short", day: "numeric" })}</span>}
                             </div>
-                            {b.mergeRequestResolvedBy && <p className="mt-0.5 text-gray-400">{isMerged ? "Merged" : "Rejected"} by {b.mergeRequestResolvedBy}</p>}
+                            {b.mergeRequestResolvedBy && <p className="mt-0.5 text-gray-400">Rejected by {b.mergeRequestResolvedBy}</p>}
                           </div>
                         );
                       })}
@@ -2731,15 +2829,15 @@ export default function DocumentEditorPage() {
               {document.parentDocumentId && (
                 <Button
                   size="sm"
-                  variant={document.mergeRequestStatus === "pending" || document.mergeRequestStatus === "merged" ? "outline" : document.mergeRequestStatus === "rejected" ? "destructive" : "default"}
+                  variant={document.mergeRequestStatus === "pending" ? "outline" : document.mergeRequestStatus === "rejected" ? "destructive" : "default"}
                   className="w-full justify-start"
-                  disabled={document.mergeRequestStatus === "pending" || document.mergeRequestStatus === "merged"}
+                  disabled={document.mergeRequestStatus === "pending"}
                   onClick={() => { setMergeRequestMsg(""); setMergeRequestOpen(true); }}
                 >
                   <GitMerge className="mr-2 h-4 w-4 shrink-0" />
                   {document.mergeRequestStatus === "pending"  ? "Merge Request Pending…" :
-                   document.mergeRequestStatus === "merged"   ? "Already Merged" :
                    document.mergeRequestStatus === "rejected" ? "Resubmit Merge Request" :
+                   document.lastMergedAt                      ? "Request Another Merge" :
                                                                 "Request Merge"}
                 </Button>
               )}
@@ -2979,17 +3077,26 @@ export default function DocumentEditorPage() {
           })()}
 
           <DialogFooter className="gap-2">
-            <Button variant="outline" className="text-red-600 hover:bg-red-50" onClick={handleRejectMerge} disabled={mergeApplying}>
-              <X className="mr-1.5 h-4 w-4" />Reject
-            </Button>
-            <Button variant="outline" onClick={() => setMergeReviewOpen(false)} disabled={mergeApplying}>Close</Button>
-            <Button
-              onClick={handleApplyMerge}
-              disabled={mergeApplying || mergeDiffBlocks.filter((b) => b.status === "conflict" && !mergeResolutions.has(b.idx)).length > 0}
-            >
-              <GitMerge className="mr-1.5 h-4 w-4" />
-              {mergeApplying ? "Merging…" : "Merge"}
-            </Button>
+            {canReviewMerges ? (
+              <>
+                <Button variant="outline" className="text-red-600 hover:bg-red-50" onClick={handleRejectMerge} disabled={mergeApplying}>
+                  <X className="mr-1.5 h-4 w-4" />Reject
+                </Button>
+                <Button variant="outline" onClick={() => setMergeReviewOpen(false)} disabled={mergeApplying}>Close</Button>
+                <Button
+                  onClick={handleApplyMerge}
+                  disabled={mergeApplying || mergeDiffBlocks.filter((b) => b.status === "conflict" && !mergeResolutions.has(b.idx)).length > 0}
+                >
+                  <GitMerge className="mr-1.5 h-4 w-4" />
+                  {mergeApplying ? "Merging…" : "Merge"}
+                </Button>
+              </>
+            ) : (
+              <>
+                <p className="mr-auto text-sm text-gray-500">Only the document owner can accept or reject merges.</p>
+                <Button variant="outline" onClick={() => setMergeReviewOpen(false)}>Close</Button>
+              </>
+            )}
           </DialogFooter>
         </DialogContent>
       </Dialog>

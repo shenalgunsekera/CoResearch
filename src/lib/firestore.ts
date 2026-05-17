@@ -355,16 +355,22 @@ export async function getBranchDocumentsForParent(parentDocumentId: string): Pro
     .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 }
 
-// Real-time subscription for branch documents so parent owner sees incoming merge requests instantly
+// Real-time subscription for branch documents so parent owner sees incoming merge requests instantly.
+// Must include userId so Firestore can prove the user is authorised (rule checks collaboratorIds).
 export function subscribeToBranchDocuments(
   parentDocumentId: string,
+  userId: string,
   onChange: (branches: Document[]) => void,
 ): () => void {
-  const q = query(collection(getDbOrThrow(), DOCUMENTS), where("parentDocumentId", "==", parentDocumentId));
+  const q = query(
+    collection(getDbOrThrow(), DOCUMENTS),
+    where("parentDocumentId", "==", parentDocumentId),
+    where("collaboratorIds", "array-contains", userId),
+  );
   return onSnapshot(q, (snap) => {
     const branches = snap.docs
       .map((d) => ({ ...(d.data() as Omit<Document, "id">), id: d.id }))
-      .sort((a, b) => (b.mergeRequestCreatedAt ?? b.updatedAt).localeCompare(a.mergeRequestCreatedAt ?? a.updatedAt));
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
     onChange(branches);
   });
 }
