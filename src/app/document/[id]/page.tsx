@@ -783,10 +783,17 @@ export default function DocumentEditorPage() {
   const effectiveContent = editorHtml || baseContent;
   const currentImageUrls = useMemo(() => extractImageUrlsFromHtml(effectiveContent), [effectiveContent]);
   const allImageUrls = useMemo(() => uniqueUrls([...currentImageUrls, ...trackedImageUrls]), [currentImageUrls, trackedImageUrls]);
+  // hasChanges — drives auto-save (is the editor ahead of what Firestore has right now?)
   const hasChanges = effectiveTitle !== baseTitle || effectiveContent !== baseContent;
   const collaboratorRole = user ? collaborators.find((collab) => collab.id === user.id)?.role : undefined;
   const canManageDocument = !!document && !!user && (document.ownerId === user.id || user.role === "admin");
-  const hasEditorRole = !!document && !!user && (canManageDocument || collaboratorRole === "editor" || collaboratorRole === "owner");
+  // Editors have edit access by default; owner can revoke with canCommit: false
+  const collaboratorEntry = user ? collaborators.find((c) => c.id === user.id) : undefined;
+  const hasEditorRole = !!document && !!user && (
+    canManageDocument ||
+    collaboratorRole === "owner" ||
+    (collaboratorRole === "editor" && collaboratorEntry?.canCommit !== false)
+  );
   const isDiscoverReadOnlyView =
     !!document &&
     isPublishedView &&
@@ -803,6 +810,19 @@ export default function DocumentEditorPage() {
     !isDiscoverReadOnlyView &&
     !mergeRequestLocked &&
     document?.stage !== "published";
+
+  // hasChangesSinceVersion — drives the Save button.
+  // Compares against the last explicit version checkpoint, NOT the last auto-save.
+  // Stays true after auto-save so the Save button remains available.
+  const lastVersionContent = document?.versions?.length
+    ? document.versions[document.versions.length - 1].content
+    : null;
+  const hasChangesSinceVersion = canEdit && (
+    lastVersionContent === null
+      ? effectiveContent.replace(/<[^>]+>/g, "").trim().length > 0
+      : effectiveContent !== lastVersionContent || effectiveTitle !== baseTitle
+  );
+
   const canInvite = canManageDocument && !isDiscoverReadOnlyView;
   const canPublish = !!document && canManageDocument && !isNewDocument && !document.parentDocumentId && !isDiscoverReadOnlyView;
   const canCreateBranch = !!document && !document.parentDocumentId && hasEditorRole && !isDiscoverReadOnlyView;
@@ -1664,6 +1684,13 @@ export default function DocumentEditorPage() {
         editorMode === "quill"
           ? quillInstanceRef.current?.root.innerHTML || effectiveContent
           : editor ? editor.getHTML() : effectiveContent;
+
+      // Skip silently if this would create a duplicate of the last version
+      if (document.versions.length > 0) {
+        const lastV = document.versions[document.versions.length - 1];
+        if (liveContent === lastV.content && effectiveTitle === document.title) return;
+      }
+
       const liveImageUrls = uniqueUrls([...extractImageUrlsFromHtml(liveContent), ...trackedImageUrls]);
       const nextVersion: Version = {
         id: `v${document.versions.length + 1}`,
@@ -1831,12 +1858,14 @@ export default function DocumentEditorPage() {
     if (document.mergeRequestStatus === "pending") return toast.info("A merge request is already pending review.");
     setMergeRequestLoading(true);
     try {
-      // Save latest content first so the reviewer always sees the freshest version
-      await handleSave(
-        document.mergeRequestStatus === "rejected"
-          ? "Updated before resubmitting merge request"
-          : "Auto-saved before merge request",
-      );
+      // Only create a version if the content has actually changed since the last one
+      if (hasChangesSinceVersion) {
+        await handleSave(
+          document.mergeRequestStatus === "rejected"
+            ? "Updated before resubmitting merge request"
+            : "Saved before merge request",
+        );
+      }
       const now = new Date().toISOString();
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       await updateDocument(document.id, {
@@ -1969,6 +1998,33 @@ export default function DocumentEditorPage() {
   };
 
   // Parent doc owner rejects the merge request
+  // Branch author withdraws their own pending merge request — unlocks the branch for more editing
+  const handleCancelMergeRequest = async () => {
+    if (!document?.parentDocumentId || !user) return;
+    if (document.mergeRequestStatus !== "pending") return;
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await updateDocument(document.id, {
+        mergeRequestStatus: deleteField() as any,
+        mergeRequestMessage: deleteField() as any,
+        mergeRequestCreatedAt: deleteField() as any,
+        mergeRequestAuthorId: deleteField() as any,
+        mergeRequestAuthorName: deleteField() as any,
+      });
+      setPersistedDocument((prev) => prev ? {
+        ...prev,
+        mergeRequestStatus: undefined,
+        mergeRequestMessage: undefined,
+        mergeRequestCreatedAt: undefined,
+        mergeRequestAuthorId: undefined,
+        mergeRequestAuthorName: undefined,
+      } : prev);
+      toast.success("Merge request cancelled — you can keep editing and resubmit when ready.");
+    } catch (err) {
+      toast.error(`Failed to cancel: ${getErrorMessage(err)}`);
+    }
+  };
+
   const handleRejectMerge = async () => {
     if (!activeBranchDoc || !user) return;
     try {
@@ -2262,8 +2318,14 @@ export default function DocumentEditorPage() {
               {document.currentVersion > 0 ? `v${document.currentVersion}` : "draft"}
             </Badge>
             {isDiscoverReadOnlyView && <Badge className="hidden bg-green-100 text-green-800 sm:inline-flex">Read-only</Badge>}
+            {/* Local edits not yet sent to Firestore */}
             {hasChanges && !autoSaving && <Badge className="bg-amber-100 text-amber-800">Unsaved</Badge>}
+            {/* Auto-save in progress */}
             {autoSaving && <Badge className="bg-blue-100 text-blue-800">Saving…</Badge>}
+            {/* Content in Firestore is current, but no version checkpoint yet */}
+            {!hasChanges && !autoSaving && hasChangesSinceVersion && (
+              <Badge className="bg-violet-100 text-violet-800">No version</Badge>
+            )}
 
             {/* Action buttons — image + AI hidden on xs, shown on sm+ */}
             <Button
@@ -2290,7 +2352,7 @@ export default function DocumentEditorPage() {
             <Button
               size="sm"
               onClick={() => { setCommitMessage(""); setCommitOpen(true); }}
-              disabled={!canEdit || !hasChanges}
+              disabled={!hasChangesSinceVersion}
             >
               <Save className="h-4 w-4" />
               <span className="ml-1.5 hidden sm:inline">
@@ -2316,7 +2378,7 @@ export default function DocumentEditorPage() {
                      : justMerged ? <Check className="h-3.5 w-3.5 shrink-0" />
                                   : <GitBranch className="h-3.5 w-3.5 shrink-0" />;
         const message = isPending
-          ? "Merge request pending — editing is locked while the owner reviews your changes."
+          ? "Merge request pending — editing is locked. Cancel the request (in the sidebar) to keep editing."
           : isRejected
           ? `Rejected by ${document.mergeRequestResolvedBy ?? "the owner"}. Update your changes and resubmit.`
           : justMerged
@@ -2460,7 +2522,7 @@ export default function DocumentEditorPage() {
                     <div className="flex flex-wrap items-center gap-2">
                       <Button size="sm" variant="outline" onMouseDown={(e) => e.preventDefault()} onClick={handleUndo}><Undo2 className="mr-2 h-4 w-4" />Undo</Button>
                       <Button size="sm" variant="outline" onMouseDown={(e) => e.preventDefault()} onClick={handleRedo}><Redo2 className="mr-2 h-4 w-4" />Redo</Button>
-                      <Button data-tour-id="document-save-version" size="sm" onClick={() => { setCommitMessage(""); setCommitOpen(true); }} disabled={!hasChanges}>
+                      <Button data-tour-id="document-save-version" size="sm" onClick={() => { setCommitMessage(""); setCommitOpen(true); }} disabled={!hasChangesSinceVersion}>
                         <Save className="mr-2 h-4 w-4" />{document.parentDocumentId ? "Save to Branch" : "Save Version"}
                       </Button>
                     </div>
@@ -2625,32 +2687,58 @@ export default function DocumentEditorPage() {
                     <p className="text-sm font-medium truncate">{collab.name}</p>
                     <p className="text-xs text-gray-500">{collab.role}</p>
                   </div>
-                  {/* Owner can grant merge-review permission to editors */}
+                  {/* Owner toggles per-editor permissions */}
                   {canManageDocument && collab.role === "editor" && (
-                    <button
-                      type="button"
-                      title={collab.canMerge ? "Remove merge permission" : "Grant merge permission"}
-                      onClick={async () => {
-                        if (!document) return;
-                        const updated = collaborators.map((c) =>
-                          c.id === collab.id ? { ...c, canMerge: !collab.canMerge } : c,
-                        );
-                        await updateDocument(document.id, { collaborators: updated, updatedAt: new Date().toISOString() });
-                        setPersistedDocument((prev) => prev ? { ...prev, collaborators: updated } : prev);
-                      }}
-                      className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-semibold transition-colors ${
-                        collab.canMerge
-                          ? "bg-blue-100 text-blue-700 hover:bg-blue-200"
-                          : "bg-gray-100 text-gray-400 hover:bg-gray-200"
-                      }`}
-                    >
-                      <GitMerge className="h-3 w-3" />
-                    </button>
+                    <div className="flex gap-1 shrink-0">
+                      <button
+                        type="button"
+                        title={collab.canCommit === false ? "Commits blocked — click to allow" : "Commits allowed — click to block"}
+                        onClick={async () => {
+                          if (!document) return;
+                          const updated = collaborators.map((c) =>
+                            c.id === collab.id ? { ...c, canCommit: collab.canCommit === false ? true : false } : c,
+                          );
+                          await updateDocument(document.id, { collaborators: updated, updatedAt: new Date().toISOString() });
+                          setPersistedDocument((prev) => prev ? { ...prev, collaborators: updated } : prev);
+                        }}
+                        className={`rounded px-1.5 py-0.5 text-[10px] font-semibold transition-colors ${
+                          collab.canCommit === false
+                            ? "bg-red-100 text-red-600 hover:bg-red-200"
+                            : "bg-green-100 text-green-700 hover:bg-green-200"
+                        }`}
+                      >
+                        <GitCommit className="h-3 w-3" />
+                      </button>
+                      <button
+                        type="button"
+                        title={collab.canMerge ? "Remove merge-review permission" : "Grant merge-review permission"}
+                        onClick={async () => {
+                          if (!document) return;
+                          const updated = collaborators.map((c) =>
+                            c.id === collab.id ? { ...c, canMerge: !collab.canMerge } : c,
+                          );
+                          await updateDocument(document.id, { collaborators: updated, updatedAt: new Date().toISOString() });
+                          setPersistedDocument((prev) => prev ? { ...prev, collaborators: updated } : prev);
+                        }}
+                        className={`rounded px-1.5 py-0.5 text-[10px] font-semibold transition-colors ${
+                          collab.canMerge
+                            ? "bg-blue-100 text-blue-700 hover:bg-blue-200"
+                            : "bg-gray-100 text-gray-400 hover:bg-gray-200"
+                        }`}
+                      >
+                        <GitMerge className="h-3 w-3" />
+                      </button>
+                    </div>
                   )}
-                  {collab.role === "editor" && collab.canMerge && !canManageDocument && (
-                    <span className="shrink-0 rounded bg-blue-100 px-1.5 py-0.5 text-[10px] font-semibold text-blue-700">
-                      can merge
-                    </span>
+                  {collab.role === "editor" && !canManageDocument && (collab.canMerge || collab.canCommit === false) && (
+                    <div className="flex gap-1 shrink-0">
+                      {collab.canCommit === false && (
+                        <span className="rounded bg-red-100 px-1.5 py-0.5 text-[10px] font-semibold text-red-600">read-only</span>
+                      )}
+                      {collab.canMerge && (
+                        <span className="rounded bg-blue-100 px-1.5 py-0.5 text-[10px] font-semibold text-blue-700">can merge</span>
+                      )}
+                    </div>
                   )}
                 </div>
               ))}
@@ -2683,12 +2771,22 @@ export default function DocumentEditorPage() {
                     const mrs = document.mergeRequestStatus;
                     if (mrs === "pending") return (
                       <div className="rounded-lg border border-amber-300 bg-amber-50 p-2.5 text-xs">
-                        <span className="inline-flex items-center gap-0.5 rounded-full bg-amber-100 px-1.5 py-0.5 text-[10px] font-semibold text-amber-700">
-                          <AlertTriangle className="h-2.5 w-2.5" />Pending Review
-                        </span>
+                        <div className="flex items-center justify-between gap-1">
+                          <span className="inline-flex items-center gap-0.5 rounded-full bg-amber-100 px-1.5 py-0.5 text-[10px] font-semibold text-amber-700">
+                            <AlertTriangle className="h-2.5 w-2.5" />Pending Review
+                          </span>
+                          <button
+                            type="button"
+                            onClick={handleCancelMergeRequest}
+                            className="rounded bg-gray-100 px-2 py-0.5 text-[10px] font-semibold text-gray-600 hover:bg-gray-200 transition-colors"
+                            title="Withdraw this merge request and resume editing"
+                          >
+                            Cancel Request
+                          </button>
+                        </div>
                         {document.mergeRequestMessage && <p className="mt-1 italic text-gray-500 line-clamp-2">&quot;{document.mergeRequestMessage}&quot;</p>}
                         {document.mergeRequestCreatedAt && <p className="mt-1 text-gray-400">Submitted {new Date(document.mergeRequestCreatedAt).toLocaleDateString(undefined, { month: "short", day: "numeric" })}</p>}
-                        <p className="mt-1.5 text-amber-700 font-medium">Editing locked while owner reviews.</p>
+                        <p className="mt-1.5 text-amber-700">Editing locked while owner reviews. Cancel to keep editing.</p>
                       </div>
                     );
                     if (mrs === "rejected") return (
@@ -2835,7 +2933,7 @@ export default function DocumentEditorPage() {
                   onClick={() => { setMergeRequestMsg(""); setMergeRequestOpen(true); }}
                 >
                   <GitMerge className="mr-2 h-4 w-4 shrink-0" />
-                  {document.mergeRequestStatus === "pending"  ? "Merge Request Pending…" :
+                  {document.mergeRequestStatus === "pending"  ? "Request Pending (Cancel to edit)" :
                    document.mergeRequestStatus === "rejected" ? "Resubmit Merge Request" :
                    document.lastMergedAt                      ? "Request Another Merge" :
                                                                 "Request Merge"}

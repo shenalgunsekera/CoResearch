@@ -78,7 +78,8 @@ export interface Collaborator {
   email: string;
   role: "owner" | "editor" | "viewer";
   joinedAt: string;
-  canMerge?: boolean; // Owner can grant this to let editors approve/reject merge requests
+  canMerge?: boolean;  // Owner can grant this to let editors approve/reject merge requests
+  canCommit?: boolean; // Owner can grant this to let editors save versions (defaults true for editors)
 }
 
 export interface Version {
