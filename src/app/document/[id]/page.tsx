@@ -10,6 +10,7 @@ import { type Comment, type Document, type DocumentPresence, type User, type Ver
 import {
   addCommentToDocument,
   createDocument,
+  deleteField,
   getBranchDocumentsForParent,
   subscribeToBranchDocuments,
   getCommentsForDocument,
@@ -1826,18 +1827,27 @@ export default function DocumentEditorPage() {
           : "Auto-saved before merge request",
       );
       const now = new Date().toISOString();
-      const updates = {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await updateDocument(document.id, {
+        mergeRequestStatus: "pending",
+        mergeRequestMessage: mergeRequestMsg.trim() || "Requesting to merge branch changes",
+        mergeRequestCreatedAt: now,
+        mergeRequestAuthorId: user.id,
+        mergeRequestAuthorName: user.name,
+        mergeRequestResolvedAt: deleteField() as any,
+        mergeRequestResolvedBy: deleteField() as any,
+      });
+      // Local state uses plain undefined (not deleteField sentinel)
+      const localUpdates = {
         mergeRequestStatus: "pending" as const,
         mergeRequestMessage: mergeRequestMsg.trim() || "Requesting to merge branch changes",
         mergeRequestCreatedAt: now,
         mergeRequestAuthorId: user.id,
         mergeRequestAuthorName: user.name,
-        // Clear previous rejection metadata
         mergeRequestResolvedAt: undefined,
         mergeRequestResolvedBy: undefined,
       };
-      await updateDocument(document.id, updates);
-      setPersistedDocument((prev) => prev ? { ...prev, ...updates } : prev);
+      setPersistedDocument((prev) => prev ? { ...prev, ...localUpdates } : prev);
       setMergeRequestOpen(false);
       setMergeRequestMsg("");
       toast.success(
