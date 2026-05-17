@@ -809,12 +809,18 @@ export default function DocumentEditorPage() {
   const mergeRequestLocked =
     !!document?.parentDocumentId &&
     document.mergeRequestStatus === "pending";
+  // True when the branch's base is behind the current parent document content (must be before canEdit)
+  const parentOutOfSync =
+    !!document?.parentDocumentId &&
+    !!parentDocument &&
+    parentDocument.content !== (document?.branchAncestorContent ?? "");
   // Published documents are permanently read-only regardless of how they're accessed
   const canEdit =
     !!user &&
     hasEditorRole &&
     !isDiscoverReadOnlyView &&
     !mergeRequestLocked &&
+    !parentOutOfSync &&
     document?.stage !== "published";
 
   // hasChangesSinceVersion — drives the Save button.
@@ -837,11 +843,6 @@ export default function DocumentEditorPage() {
     !!document && !!user && !isNewDocument &&
     (document.ownerId === user.id ||
      collaborators.find((c) => c.id === user.id)?.canMerge === true);
-  // True when the branch's base is behind the current parent document content
-  const parentOutOfSync =
-    !!document?.parentDocumentId &&
-    !!parentDocument &&
-    parentDocument.content !== (document?.branchAncestorContent ?? "");
   const canComment = !!document && !!user && !isNewDocument && !isDiscoverReadOnlyView;
   const canViewDocument =
     !!document &&
